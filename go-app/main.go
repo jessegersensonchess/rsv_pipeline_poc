@@ -30,6 +30,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -43,13 +44,15 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	// Postgres driver (used by the Postgres adapter)
 	"github.com/jackc/pgx/v5"
 
 	// Optional MSSQL driver (used by the generic SQL adapter when --db_driver=mssql)
-	_ "github.com/microsoft/go-mssqldb"
+	mssql "github.com/microsoft/go-mssqldb"
 )
 
 // -------------------------
@@ -1056,6 +1059,128 @@ func rowToJSON(headers, fields []string) ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// ---------------------------------------
+// Fast JSON encoder (no maps in hot path)
+// ---------------------------------------
+//
+// Idea: precompute `"Header":` byte prefixes once; for each row,
+// write `{<prefix><quoted value>,...}` into a pooled bytes.Buffer.
+// We use strconv.AppendQuote to safely JSON-escape values without
+// the overhead of map hashing or reflect.
+//
+// This is dramatically cheaper than building map[string]string
+// and calling encoding/json for each row.
+
+// ---------------------------------------
+// Fast JSON encoder (UTF-8 safe, no maps)
+// ---------------------------------------
+type fastJSONEncoder struct {
+	prefixes [][]byte
+	bufPool  sync.Pool
+}
+
+func newFastJSONEncoder(headers []string) *fastJSONEncoder {
+	pfx := make([][]byte, len(headers))
+	for i, h := range headers {
+		var b bytes.Buffer
+		b.WriteByte('"')
+		// Sanitize header to valid UTF-8 (paranoid; usually headers are fine)
+		hb := bytes.ToValidUTF8([]byte(h), []byte{0xEF, 0xBF, 0xBD}) // U+FFFD
+		tmp := strconv.AppendQuote(nil, string(hb))                  // "Header"
+		if len(tmp) >= 2 && tmp[0] == '"' && tmp[len(tmp)-1] == '"' {
+			b.Write(tmp[1 : len(tmp)-1])
+		} else {
+			b.Write(hb)
+		}
+		b.WriteString(`":`)
+		pfx[i] = append([]byte(nil), b.Bytes()...)
+	}
+	return &fastJSONEncoder{
+		prefixes: pfx,
+		bufPool: sync.Pool{
+			New: func() any { return new(bytes.Buffer) },
+		},
+	}
+}
+
+func (e *fastJSONEncoder) EncodeRow(fields []string) []byte {
+	// Borrow buffer
+	buf := e.bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.WriteByte('{')
+
+	for i := range e.prefixes {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(e.prefixes[i])
+
+		// Sanitize field text to valid UTF-8, then JSON-escape
+		v := bytes.ToValidUTF8([]byte(fields[i]), []byte{0xEF, 0xBF, 0xBD})
+		tmp := strconv.AppendQuote(nil, string(v))
+		buf.Write(tmp)
+	}
+
+	buf.WriteByte('}')
+	out := append([]byte(nil), buf.Bytes()...)
+	e.bufPool.Put(buf)
+	return out
+}
+
+// pgxEncodedSource implements pgx.CopyFromSource to stream rows from a channel,
+// while emitting periodic progress logs and recording skips via callback.
+type pgxEncodedSource struct {
+	ch      <-chan encodedJob
+	current []interface{}
+	err     error
+	addSkip func(reason string, ln int, pcvField, raw string)
+	isPG    bool
+
+	// progress
+	inserted int
+	logEvery int                             // e.g. 50_000
+	logf     func(inserted int, skipped int) // writer-provided logger
+	// skipped is tracked by addSkip in writer; we pass via closure
+}
+
+func (s *pgxEncodedSource) Next() bool {
+	for job := range s.ch {
+		// Skip invalid/errored rows; mirror existing reasons
+		if job.pcv == 0 || job.payload == nil {
+			if job.payload == nil && job.pcv == 0 && job.pcvField == "" {
+				s.addSkip("parse_error", job.lineNum, "", job.raw)
+			} else if job.pcv == 0 {
+				s.addSkip("pcv_not_numeric", job.lineNum, job.pcvField, job.raw)
+			} else {
+				s.addSkip("json_marshal_error", job.lineNum, strconv.FormatInt(job.pcv, 10), job.raw)
+			}
+			continue
+		}
+		if !json.Valid(job.payload) {
+			s.addSkip("invalid_json", job.lineNum, strconv.FormatInt(job.pcv, 10), job.raw)
+			continue
+		}
+
+		// Build one row with no extra allocs.
+		if s.isPG {
+			s.current = []interface{}{job.pcv, job.payload}
+		} else {
+			s.current = []interface{}{job.pcv, string(job.payload)}
+		}
+
+		// Progress
+		s.inserted++
+		if s.logEvery > 0 && (s.inserted%s.logEvery) == 0 && s.logf != nil {
+			// skipped count is maintained inside writer via addSkip closure; logf captures it.
+			s.logf(s.inserted, 0)
+		}
+		return true
+	}
+	return false
+}
+func (s *pgxEncodedSource) Values() ([]interface{}, error) { return s.current, nil }
+func (s *pgxEncodedSource) Err() error                     { return s.err }
+
 /*
 	CLEAN-CODE REFACTOR of importVehicleTech
 	----------------------------------------
@@ -1111,9 +1236,428 @@ func ensureVehicleTechTable(ctx context.Context, db DB, unlogged bool, driver st
 	}
 }
 
+// start refactor
+// ---- vehicle tech pipeline primitives ----
+
+type rawJob struct {
+	line    string
+	lineNum int
+}
+type parsedJob struct {
+	fields  []string
+	lineNum int
+	raw     string
+}
+type encodedJob struct {
+	pcv      int64
+	pcvField string
+	payload  []byte
+	lineNum  int
+	raw      string
+}
+type writerStats struct {
+	inserted int
+	skipped  int
+	reasons  map[string]int
+	err      error
+}
+
+type VehicleTechPipeline struct {
+	ctx       context.Context
+	cfg       *Config
+	factory   DBFactory
+	headers   []string
+	pcvIdx    int
+	statusIdx int
+	jsonEnc   *fastJSONEncoder
+	isPG      bool
+
+	// channels
+	rawCh     chan rawJob
+	parsedCh  chan parsedJob
+	encodedCh chan encodedJob
+	errCh     chan error
+
+	// workers
+	parserWorkers  int
+	encoderWorkers int
+	initialWriters int
+	maxWriters     int
+
+	// sync
+	parseWG sync.WaitGroup
+	encWG   sync.WaitGroup
+	writeWG sync.WaitGroup
+
+	activeWriters atomic.Int32
+	digitsOnly    *regexp.Regexp
+}
+
+// extractPCVWithRSVFallback first uses the existing header/Status-based logic,
+// and if that yields 0, it falls back to scanning the raw line for ",RSV,"
+// and taking the 4th comma-delimited field from that point (to match the shell:
+//
+//	grep -o ,RSV,.* | cut -f4 -d","  ==> field index 3 in the ",RSV,..." slice).
+func extractPCVWithRSVFallback(
+	headers, fields []string,
+	pcvIdx, statusIdx int,
+	digitsOnly *regexp.Regexp,
+	rawLine string,
+) (int64, string) {
+	// 1) Try the normal heuristics
+	if v, s := extractPCV(headers, fields, pcvIdx, statusIdx, digitsOnly); v != 0 {
+		return v, s
+	}
+
+	// 2) Fallback: look for ",RSV," literal and take the 4th field after it.
+	//    Example: ",RSV,<f2>,<f3>,<PCV>,..."  -> we want index 3 in the split.
+	const anchor = ",RSV,"
+	i := strings.Index(rawLine, anchor)
+	if i == -1 {
+		return 0, ""
+	}
+
+	// Keep the leading comma to match your CLI pipeline behavior exactly.
+	sub := rawLine[i:] // starts with ",RSV,..."
+	parts := strings.Split(sub, ",")
+	// parts[0] == ""  parts[1] == "RSV"  parts[2] == <f2>  parts[3] == <PCV>
+	if len(parts) < 4 {
+		return 0, ""
+	}
+	candidate := strings.TrimSpace(parts[3])
+	// Strip surrounding quotes if present
+	candidate = strings.Trim(candidate, `"'`)
+
+	if !digitsOnly.MatchString(candidate) {
+		return 0, ""
+	}
+	v, err := strconv.ParseInt(candidate, 10, 64)
+	if err != nil {
+		return 0, ""
+	}
+	return v, candidate
+}
+
+func newVehicleTechPipeline(ctx context.Context, cfg *Config, factory DBFactory, headers []string, pcvIdx, statusIdx int) *VehicleTechPipeline {
+	p := &VehicleTechPipeline{
+		ctx:            ctx,
+		cfg:            cfg,
+		factory:        factory,
+		headers:        headers,
+		pcvIdx:         pcvIdx,
+		statusIdx:      statusIdx,
+		jsonEnc:        newFastJSONEncoder(headers),
+		isPG:           strings.ToLower(cfg.DBDriver) == "postgres",
+		rawCh:          make(chan rawJob, 64*1024),
+		parsedCh:       make(chan parsedJob, 8*1024),
+		encodedCh:      make(chan encodedJob, 8*1024),
+		errCh:          make(chan error, 4),
+		parserWorkers:  cfg.Workers,
+		encoderWorkers: max(8, cfg.Workers/2), // was 1
+		initialWriters: max(8, cfg.Workers/4), // was 1
+		maxWriters:     max(9, cfg.Workers),
+		digitsOnly:     regexp.MustCompile(`^\d+$`),
+	}
+	p.activeWriters.Store(int32(p.initialWriters))
+	return p
+}
+
+func (p *VehicleTechPipeline) startReader(r *bufio.Reader) {
+	go func() {
+		defer close(p.rawCh)
+		lineNum := 1 // header consumed
+		for {
+			l, err := readLogicalCSVLine(r)
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				p.errCh <- fmt.Errorf("tech read error: %w", err)
+				return
+			}
+			lineNum++
+			p.rawCh <- rawJob{line: l, lineNum: lineNum}
+		}
+	}()
+}
+
+func (p *VehicleTechPipeline) startParsers() {
+	p.parseWG.Add(p.parserWorkers)
+	for i := 0; i < p.parserWorkers; i++ {
+		go func() {
+			defer p.parseWG.Done()
+			for j := range p.rawCh {
+				fields, err := parseCSVLineLoose(j.line)
+				if err != nil {
+					p.parsedCh <- parsedJob{fields: nil, lineNum: j.lineNum, raw: j.line}
+					continue
+				}
+				p.parsedCh <- parsedJob{fields: fields, lineNum: j.lineNum, raw: j.line}
+			}
+		}()
+	}
+	go func() {
+		p.parseWG.Wait()
+		close(p.parsedCh)
+	}()
+}
+
+func (p *VehicleTechPipeline) startEncoders() {
+	p.encWG.Add(p.encoderWorkers)
+	for i := 0; i < p.encoderWorkers; i++ {
+		go func() {
+			defer p.encWG.Done()
+			for j := range p.parsedCh {
+				if j.fields == nil {
+					p.encodedCh <- encodedJob{pcv: 0, pcvField: "", payload: nil, lineNum: j.lineNum, raw: j.raw}
+					continue
+				}
+				fields := j.fields
+
+				// PCV extraction with RSV fallback (handles poorly formatted lines)
+				pcv, pcvField := extractPCVWithRSVFallback(
+					p.headers, fields, p.pcvIdx, p.statusIdx, p.digitsOnly, j.raw,
+				)
+				if pcv == 0 {
+					p.encodedCh <- encodedJob{pcv: 0, pcvField: pcvField, payload: nil, lineNum: j.lineNum, raw: j.raw}
+					continue
+				}
+
+				// normalize field count
+				switch {
+				case len(fields) > len(p.headers):
+					fields = fields[:len(p.headers)]
+				case len(fields) < len(p.headers):
+					fields = append(fields, make([]string, len(p.headers)-len(fields))...)
+				}
+
+				js := p.jsonEnc.EncodeRow(fields)
+				p.encodedCh <- encodedJob{pcv: pcv, pcvField: pcvField, payload: js, lineNum: j.lineNum, raw: j.raw}
+			}
+		}()
+	}
+	go func() {
+		p.encWG.Wait()
+		close(p.encodedCh)
+	}()
+}
+
+func (p *VehicleTechPipeline) writerFn(id int, statsCh chan<- writerStats) {
+	defer p.writeWG.Done()
+	res := writerStats{reasons: map[string]int{}}
+
+	// per-writer skipped CSV
+	if err := os.MkdirAll("skipped", 0o755); err != nil {
+		res.err = fmt.Errorf("writer %d create skipped dir: %w", id, err)
+		statsCh <- res
+		return
+	}
+	skf, err := os.Create(filepath.Join("skipped", fmt.Sprintf("skipped_vehicle_tech_w%d.csv", id)))
+	if err != nil {
+		res.err = fmt.Errorf("writer %d skipped file: %w", id, err)
+		statsCh <- res
+		return
+	}
+	defer skf.Close()
+	skw := csv.NewWriter(skf)
+	defer skw.Flush()
+	_ = skw.Write([]string{"reason", "line_number", "pcv_field", "raw_line"})
+	addSkip := func(reason string, ln int, pcvField, raw string) {
+		res.reasons[reason]++
+		res.skipped++
+		_ = skw.Write([]string{reason, strconv.Itoa(ln), pcvField, raw})
+	}
+
+	// streaming paths
+	logEvery := 5_000
+	if p.cfg.BatchSize > 0 && p.cfg.BatchSize*5 > logEvery {
+		logEvery = p.cfg.BatchSize * 5
+	}
+
+	if p.isPG {
+		// ---------- POSTGRES: streaming COPY with periodic progress ----------
+		dbc, err := p.factory(p.ctx)
+		if err != nil {
+			res.err = fmt.Errorf("writer %d connect: %w", id, err)
+			statsCh <- res
+			return
+		}
+		defer dbc.Close(p.ctx)
+
+		pgdb, ok := dbc.(*pgDB)
+		if !ok {
+			res.err = fmt.Errorf("writer %d: internal type assertion to *pgDB failed", id)
+			statsCh <- res
+			return
+		}
+
+		insertedAtLastLog := 0
+		src := &pgxEncodedSource{
+			ch: p.encodedCh,
+			addSkip: func(reason string, ln int, pcvField, raw string) {
+				// NEW: if invalid_json has no pcv, try RSV fallback for better logging
+				if reason == "invalid_json" && (pcvField == "" || pcvField == "0") {
+					if v, s := extractPCVWithRSVFallback(p.headers, nil, p.pcvIdx, p.statusIdx, p.digitsOnly, raw); v != 0 {
+						pcvField = s
+					}
+				}
+				addSkip(reason, ln, pcvField, raw)
+			},
+			isPG:     true,
+			logEvery: logEvery,
+			logf: func(ins int, _ int) {
+				delta := ins - insertedAtLastLog
+				insertedAtLastLog = ins
+				log.Printf("vehicle_tech[w%d]: inserted=%d skipped=%d (streaming COPY; +%d)", id, ins, res.skipped, delta)
+			},
+		}
+
+		n, err := pgdb.conn.CopyFrom(
+			p.ctx,
+			pgx.Identifier{"vehicle_tech"},
+			[]string{"pcv", "payload"},
+			src,
+		)
+		if err != nil {
+			res.err = fmt.Errorf("writer %d COPY FROM: %w", id, err)
+			statsCh <- res
+			return
+		}
+		res.inserted += int(n)
+		log.Printf("vehicle_tech[w%d]: inserted=%d skipped=%d (streaming COPY)", id, res.inserted, res.skipped)
+		statsCh <- res
+		return
+	}
+
+	// ---------- MSSQL: streaming bulk via mssql.CopyIn with periodic progress ----------
+	dbc, err := p.factory(p.ctx)
+	if err != nil {
+		res.err = fmt.Errorf("writer %d connect: %w", id, err)
+		statsCh <- res
+		return
+	}
+	defer dbc.Close(p.ctx)
+
+	sqlc, ok := dbc.(*sqlDB)
+	if !ok {
+		res.err = fmt.Errorf("writer %d: internal type assertion to *sqlDB failed", id)
+		statsCh <- res
+		return
+	}
+
+	stmtText := mssql.CopyIn("vehicle_tech", mssql.BulkOptions{}, "pcv", "payload")
+	stmt, err := sqlc.db.PrepareContext(p.ctx, stmtText)
+	if err != nil {
+		res.err = fmt.Errorf("writer %d CopyIn prepare: %w", id, err)
+		statsCh <- res
+		return
+	}
+
+	ins := 0
+	for job := range p.encodedCh {
+		if job.pcv == 0 || job.payload == nil {
+			if job.payload == nil && job.pcv == 0 && job.pcvField == "" {
+				addSkip("parse_error", job.lineNum, "", job.raw)
+			} else if job.pcv == 0 {
+				addSkip("pcv_not_numeric", job.lineNum, job.pcvField, job.raw)
+			} else {
+				addSkip("json_marshal_error", job.lineNum, strconv.FormatInt(job.pcv, 10), job.raw)
+			}
+			continue
+		}
+		if !json.Valid(job.payload) {
+			// NEW: recover pcv for logging via RSV fallback if needed
+			pcvField := strconv.FormatInt(job.pcv, 10)
+			if job.pcv == 0 {
+				if v, s := extractPCVWithRSVFallback(p.headers, nil, p.pcvIdx, p.statusIdx, p.digitsOnly, job.raw); v != 0 {
+					pcvField = s
+				}
+			}
+			addSkip("invalid_json", job.lineNum, pcvField, job.raw)
+			continue
+		}
+
+		if _, err := stmt.ExecContext(p.ctx, job.pcv, string(job.payload)); err != nil {
+			_ = stmt.Close()
+			res.err = fmt.Errorf("writer %d CopyIn exec: %w", id, err)
+			statsCh <- res
+			return
+		}
+		ins++
+		if ins%logEvery == 0 {
+			log.Printf("vehicle_tech[w%d]: inserted=%d skipped=%d (streaming TVP)", id, ins, res.skipped)
+		}
+	}
+
+	// finalize
+	if _, err := stmt.ExecContext(p.ctx); err != nil {
+		_ = stmt.Close()
+		res.err = fmt.Errorf("writer %d CopyIn finalize: %w", id, err)
+		statsCh <- res
+		return
+	}
+	if err := stmt.Close(); err != nil {
+		res.err = fmt.Errorf("writer %d CopyIn close: %w", id, err)
+		statsCh <- res
+		return
+	}
+
+	res.inserted += ins
+	log.Printf("vehicle_tech[w%d]: inserted=%d skipped=%d (streaming TVP/CopyIn)", id, res.inserted, res.skipped)
+	statsCh <- res
+}
+
+func (p *VehicleTechPipeline) startWritersAndAutoscale(statsCh chan<- writerStats) {
+	// initial pool
+	for i := 0; i < p.initialWriters; i++ {
+		p.writeWG.Add(1)
+		go p.writerFn(i+1, statsCh)
+	}
+
+	// autoscale: if encodedCh >80% full, add a writer up to maxWriters
+	go func() {
+		tick := time.NewTicker(3 * time.Second)
+		defer tick.Stop()
+		for range tick.C {
+			qlen, capQ := len(p.encodedCh), cap(p.encodedCh)
+			if capQ == 0 {
+				continue
+			}
+			fill := float64(qlen) / float64(capQ)
+			curr := int(p.activeWriters.Load())
+			if fill > 0.80 && curr < p.maxWriters {
+				newTotal := int(p.activeWriters.Add(1))
+				p.writeWG.Add(1)
+				go p.writerFn(newTotal, statsCh)
+				log.Printf("⚙️ autoscale: added writer w%d (queue %.0f%% full, writers=%d)", newTotal, fill*100, newTotal)
+			}
+		}
+	}()
+}
+
+func (p *VehicleTechPipeline) waitCloseStats(statsCh chan writerStats) (totalInserted, totalSkipped int, reasons map[string]int, firstErr error) {
+	// close stats when all writers done
+	go func() {
+		p.writeWG.Wait()
+		close(statsCh)
+	}()
+
+	reasons = map[string]int{}
+	for st := range statsCh {
+		totalInserted += st.inserted
+		totalSkipped += st.skipped
+		if st.err != nil && firstErr == nil {
+			firstErr = st.err
+		}
+		for k, v := range st.reasons {
+			reasons[k] += v
+		}
+	}
+	return
+}
+
 func importVehicleTech(ctx context.Context, cfg *Config, factory DBFactory, path string) error {
-	// Open once to create table / probe header
-	// We deliberately use a short-lived conn to avoid sharing tx across workers.
+	// Ensure table
 	db, err := factory(ctx)
 	if err != nil {
 		return fmt.Errorf("open db (ensure table): %w", err)
@@ -1124,22 +1668,21 @@ func importVehicleTech(ctx context.Context, cfg *Config, factory DBFactory, path
 	}
 	_ = db.Close(ctx)
 
-	// Open CSV file & parse header to discover columns + PČV index
+	// Open & read headers
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open tech csv: %w", err)
 	}
 	defer f.Close()
 
-	r := bufio.NewReaderSize(f, 4<<20) // 4 MB
-
+	r := bufio.NewReaderSize(f, 32<<20)
 	headerLine, err := readLogicalCSVLine(r)
 	if err != nil {
 		return fmt.Errorf("read tech header: %w", err)
 	}
-	headers, err := parseCSVLineLoose(headerLine)
-	if err != nil {
-		return fmt.Errorf("parse tech header: %w", err)
+	headers, perr := parseCSVLineLoose(headerLine)
+	if perr != nil {
+		return fmt.Errorf("parse tech header: %w", perr)
 	}
 	pcvIdx := findPCVIndex(headers)
 	if pcvIdx < 0 {
@@ -1153,182 +1696,56 @@ func importVehicleTech(ctx context.Context, cfg *Config, factory DBFactory, path
 		}
 	}
 
-	type job struct {
-		line    string
-		lineNum int
-	}
-	jobs := make(chan job, 32_768) // big buffer to keep workers busy
+	// Build pipeline
+	p := newVehicleTechPipeline(ctx, cfg, factory, headers, pcvIdx, statusIdx)
 
-	// Reader goroutine: stream logical rows into jobs
-	go func() {
-		lineNum := 1 // header consumed
-		for {
-			l, err := readLogicalCSVLine(r)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("⚠️ tech read error: %v", err)
-				break
-			}
-			lineNum++
-			jobs <- job{line: l, lineNum: lineNum}
-		}
-		close(jobs)
-	}()
+	// Stages
+	p.startReader(r)
+	p.startParsers()
+	p.startEncoders()
 
-	type workerResult struct {
-		inserted int
-		skipped  int
-		err      error
-		reasons  map[string]int
+	// Writers + autoscaling
+	statsCh := make(chan writerStats, p.maxWriters)
+	p.startWritersAndAutoscale(statsCh)
+
+	// Capture early read error (non-fatal if writers succeed)
+	var earlyErr error
+	select {
+	case earlyErr = <-p.errCh:
+	default:
 	}
 
-	workers := cfg.Workers
-	results := make(chan workerResult, workers)
-
-	workerFn := func(id int) {
-		res := workerResult{reasons: map[string]int{}}
-		defer func() { results <- res }()
-
-		dbc, err := factory(ctx)
-		if err != nil {
-			res.err = fmt.Errorf("worker %d connect: %w", id, err)
-			return
-		}
-		defer dbc.Close(ctx)
-
-		tx, err := dbc.BeginTx(ctx)
-		if err != nil {
-			res.err = fmt.Errorf("worker %d begin: %w", id, err)
-			return
-		}
-		defer tx.Rollback(ctx)
-
-		// per-worker skipped CSV
-		if err := os.MkdirAll("skipped", 0o755); err != nil {
-			res.err = fmt.Errorf("worker %d create skipped dir: %w", id, err)
-			return
-		}
-		skf, err := os.Create(filepath.Join("skipped", fmt.Sprintf("skipped_vehicle_tech_w%d.csv", id)))
-		if err != nil {
-			res.err = fmt.Errorf("worker %d skipped file: %w", id, err)
-			return
-		}
-		defer skf.Close()
-		skw := csv.NewWriter(skf)
-		defer skw.Flush()
-		_ = skw.Write([]string{"reason", "line_number", "pcv_field", "raw_line"})
-		addSkip := func(reason string, ln int, pcvField, raw string) {
-			res.reasons[reason]++
-			res.skipped++
-			_ = skw.Write([]string{reason, strconv.Itoa(ln), pcvField, raw})
-		}
-
-		batchSize := cfg.BatchSize
-		batch := make([][]interface{}, 0, batchSize)
-		digitsOnly := regexp.MustCompile(`^\d+$`)
-
-		for j := range jobs {
-			fields, perr := parseCSVLineLoose(j.line)
-			if perr != nil {
-				addSkip("parse_error", j.lineNum, "", j.line)
-				continue
-			}
-			origFields := fields
-
-			// PČV extraction (int64 / BIGINT)
-			pcv, pcvField := extractPCV(headers, origFields, pcvIdx, statusIdx, digitsOnly)
-			if pcv == 0 {
-				addSkip("pcv_not_numeric", j.lineNum, pcvField, j.line)
-				continue
-			}
-
-			// Normalize fields to header length for predictable JSON
-			if len(fields) > len(headers) {
-				fields = fields[:len(headers)]
-			} else if len(fields) < len(headers) {
-				fields = append(fields, make([]string, len(headers)-len(fields))...)
-			}
-
-			js, jerr := rowToJSON(headers, fields)
-			if jerr != nil {
-				addSkip("json_marshal_error", j.lineNum, strconv.FormatInt(pcv, 10), j.line)
-				continue
-			}
-
-			batch = append(batch, []interface{}{pcv, string(js)})
-
-			if len(batch) >= batchSize {
-				n, err := tx.CopyInto(ctx,
-					"vehicle_tech",
-					[]string{"pcv", "payload"},
-					batch,
-				)
-				if err != nil {
-					res.err = fmt.Errorf("worker %d copy: %w", id, err)
-					return
-				}
-				res.inserted += int(n)
-				batch = batch[:0]
-
-				log.Printf("vehicle_tech[w%d]: inserted=%d skipped=%d so far", id, res.inserted, res.skipped)
-			}
-		}
-
-		// final batch
-		if len(batch) > 0 {
-			n, err := tx.CopyInto(ctx,
-				"vehicle_tech",
-				[]string{"pcv", "payload"},
-				batch,
-			)
-			if err != nil {
-				res.err = fmt.Errorf("worker %d copy final: %w", id, err)
-				return
-			}
-			res.inserted += int(n)
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			res.err = fmt.Errorf("worker %d commit: %w", id, err)
-			return
-		}
-	}
-
-	// Launch workers
-	for i := 0; i < workers; i++ {
-		go workerFn(i + 1)
-	}
-
-	// Gather results
-	totalInserted, totalSkipped := 0, 0
-	reasonAgg := map[string]int{}
-	var firstErr error
-	for i := 0; i < workers; i++ {
-		r := <-results
-		totalInserted += r.inserted
-		totalSkipped += r.skipped
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-		}
-		for k, v := range r.reasons {
-			reasonAgg[k] += v
-		}
-	}
+	// Aggregate
+	inserted, skipped, reasons, firstErr := p.waitCloseStats(statsCh)
 	if firstErr != nil {
 		return firstErr
 	}
+	if earlyErr != nil {
+		log.Printf("⚠️ early pipeline warning: %v", earlyErr)
+	}
 
-	// Log summary
+	// Log summary with actual writer count
 	var parts []string
-	for k, v := range reasonAgg {
+	for k, v := range reasons {
 		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
 	}
-	log.Printf("vehicle_tech (parallel %d): inserted=%d skipped=%d (%s)",
-		workers, totalInserted, totalSkipped, strings.Join(parts, ", "))
+	log.Printf(
+		"vehicle_tech (pipeline: parsers=%d encoders=%d writers=%d): inserted=%d skipped=%d (%s)",
+		p.parserWorkers, p.encoderWorkers, int(p.activeWriters.Load()),
+		inserted, skipped, strings.Join(parts, ", "),
+	)
 
 	return nil
+}
+
+// end refactor
+
+// Small helper (local) to avoid sprinkling math everywhere
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 /*

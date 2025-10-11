@@ -44,4 +44,14 @@ export DB_PASSWORD=password
 export DB_NAME=testdb
 go run main.go
 
+# run locally
 
+export TZ=${TZ:-Europe/Prague}
+export DB_DRIVER=postgres
+export DB_DSN="postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable"
+export OWNERSHIP_CSV=../data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
+export VEHICLE_CSV=../data/RSV_vypis_vozidel_20250902.csv
+export WORKERS=8
+export BATCH_SIZE=2500
+
+go run main.go --db-driver=postgres --dsn  postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable --vehicle-csv=../data/RSV_vypis_vozidel_20250902.csv --ownership-csv=../data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
