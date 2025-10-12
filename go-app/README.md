@@ -100,23 +100,23 @@ Tests are designed to be hermetic:
  - Tests use per-case temp dirs to avoid path collisions
 
 ### Run tests:
-go test ./... -count=1
-docker compose run go-tests
+go test ./... -count=1  
+docker compose run go-tests  
 
 # Coverage
-go test ./... -cover
-go test ./... -coverprofile=coverage.out
-go tool cover -html=coverage.out
+go test ./... -cover  
+go test ./... -coverprofile=coverage.out  
+go tool cover -html=coverage.out  
 ### coverage per function
 go tool cover -func=cover.out
 
 # Design notes
 
-Postgres path uses native COPY FROM via pgx for throughput.
+Postgres path uses native COPY FROM via pgx for throughput.<br>  
 
-MSSQL path uses mssql.CopyIn (TVP) with batched Exec for portability.
+MSSQL path uses mssql.CopyIn (TVP) with batched Exec for portability.<br>
 
-The writer backends expose small seams (pgCopyConn, sqlPreparer, stmtCore) so tests can replace networked components with fakes while exercising real logic paths (skips, logging, finalize, error propagation).
+The writer backends expose small seams (pgCopyConn, sqlPreparer, stmtCore) so tests can replace networked components with fakes while exercising real logic paths (skips, logging, finalize, error propagation).<br>
 
 Autoscaling writers react to encoder queue fill to add capacity without over-provisioning.
 
