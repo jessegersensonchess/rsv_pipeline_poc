@@ -3,26 +3,31 @@ FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
-# Install git if your go.mod pulls private modules
+# If your go.mod pulls private modules
 RUN apk add --no-cache git
 
+# Module download cache
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build statically
+# Copy the rest of the source
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/main .
+
+# Build only the cmd/importer entrypoint
+# (pure Go, static binary)
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /out/importer ./cmd/importer
 
 # ------------------ Runtime stage ------------------
 FROM alpine:3.22
 
-# Install minimal runtime deps (certs + tzdata)
-#RUN apk add --no-cache ca-certificates tzdata
-
 ENV TZ=Europe/Prague
 WORKDIR /app
 
-COPY --from=build /out/main /app/main
+# Copy the binary
+COPY --from=build /out/importer /app/importer
 
-ENTRYPOINT ["/app/main"]
+# Default command
+ENTRYPOINT ["/app/importer"]
 

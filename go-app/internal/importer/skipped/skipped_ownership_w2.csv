@@ -1,0 +1,3 @@
+reason,line_number,pcv_field,raw_line
+field_parse_error,3,x,"x,2,3,True,100,Acme,Addr,01.01.2020,02.01.2020"
+field_parse_error,4,pcv,"pcv,typ_subjektu,vztah_k_vozidlu,aktualni,ico,nazev,adresa,datum_od,datum_do"

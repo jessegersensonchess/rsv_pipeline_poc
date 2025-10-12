@@ -143,7 +143,12 @@ services:
     environment:
       TZ: ${TZ:-Europe/Prague}
     # Run all tests (verbose + race + cover); adjust as you like
-    command: ["/bin/sh", "-c", "cd go-app && go test -v -cover ./..."]
+    command: ["/bin/sh", "-c", "
+      cd go-app && 
+      go test -v -coverprofile=coverage.out ./... &&
+      echo '\n--- Per-function coverage ---' &&
+      go tool cover -func=coverage.out
+    "]
 
 #  # ---------------- C# App (imports CSV -> Postgres) ----------------
 #  cs-app-postgres:
