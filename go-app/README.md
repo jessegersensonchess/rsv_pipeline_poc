@@ -1,6 +1,6 @@
 # csvloader
 
-A fast, testable CSV ingestion tool for importing [Czech vehicle ownership](https://download.dataovozidlech.cz/vypiszregistru/vlastnikprovozovatelvozidla) and [vehicle tech](https://download.dataovozidlech.cz/vypiszregistru/technickeprohlidky) datasets into Postgres or MSSQL.
+A fast, testable CSV ingestion tool for importing [Czech vehicle ownership](https://download.dataovozidlech.cz/vypiszregistru/vlastnikprovozovatelvozidla), [vehicle tech](https://download.dataovozidlech.cz/vypiszregistru/technickeprohlidky) and [Technické prohlídky k vozidlům](https://download.dataovozidlech.cz/) datasets into Postgres or MSSQL.
 
 - **12-factor config:** flags with environment fallbacks (see `internal/config`).
 - **Clean adapters:** database implementations behind small seams (see `internal/db`).
@@ -34,7 +34,9 @@ internal/
   csvutil/            # Resilient CSV readers/splitters for dirty data
   db/                 # DB adapters: Postgres (pgx) and MSSQL (database/sql)
   importer/
+    ownership         # Vehicle vlastník pipeline
     vehicletech/      # Vehicle tech pipeline and writer backends
+    techinspections/  # Technické prohlídky pipeline
   jsonutil/           # Minimal JSON row encoder
   pcv/                # PCV column resolver/extractor heuristics
 ```

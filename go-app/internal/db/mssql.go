@@ -269,6 +269,56 @@ func (m *smallMSSQL) CopyOwnership(ctx context.Context, records [][]interface{})
 	return tx.Commit()
 }
 
+// CreateTechInspectionsTable ensures the "tech_inspections" table exists.
+func (m *smallMSSQL) CreateTechInspectionsTable(ctx context.Context) error {
+	ddl := `
+	IF OBJECT_ID(N'tech_inspections', N'U') IS NULL
+	BEGIN
+	  CREATE TABLE tech_inspections (
+	    pcv INT,
+	    typ NVARCHAR(100),
+	    stav NVARCHAR(100),
+	    kod_stk INT,
+	    nazev_stk NVARCHAR(MAX),
+	    platnost_od DATE,
+	    platnost_do DATE,
+	    cislo_protokolu NVARCHAR(100),
+	    aktualni BIT
+	  );
+	END
+	IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'tech_inspections_pcv_idx' AND object_id = OBJECT_ID(N'tech_inspections'))
+	  CREATE INDEX tech_inspections_pcv_idx ON tech_inspections(pcv);`
+	_, err := m.db.ExecContext(ctx, ddl)
+	return err
+}
+
+// CopyTechInspections inserts rows into tech_inspections in a single transaction.
+func (m *smallMSSQL) CopyTechInspections(ctx context.Context, records [][]interface{}) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO tech_inspections(
+			pcv, typ, stav, kod_stk, nazev_stk,
+			platnost_od, platnost_do, cislo_protokolu, aktualni
+		) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, r := range records {
+		if _, err := stmt.ExecContext(ctx, r...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // Close closes the underlying connection.
 func (m *smallMSSQL) Close(ctx context.Context) error { return m.db.Close() }
 

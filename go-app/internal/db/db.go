@@ -18,9 +18,13 @@ type Tx interface {
 }
 
 type SmallDB interface {
+	Close(ctx context.Context) error
 	CreateOwnershipTable(ctx context.Context) error
 	CopyOwnership(ctx context.Context, records [][]interface{}) error
-	Close(ctx context.Context) error
+
+	// tech inspections
+	CreateTechInspectionsTable(ctx context.Context) error
+	CopyTechInspections(ctx context.Context, rows [][]interface{}) error
 }
 
 // DBFactory can mint a new DB connection per worker (for parallel ingestion).

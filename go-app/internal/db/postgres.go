@@ -12,6 +12,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/jackc/pgx/v5"
@@ -187,6 +188,76 @@ func (p *smallPg) CopyOwnership(ctx context.Context, rows [][]interface{}) error
 		log.Printf("⚠️ postgres CopyFrom inserted %d of %d rows", n, len(rows))
 	}
 	return tx.Commit(ctx)
+}
+
+// CreateTechInspectionsTable ensures the "tech_inspections" table exists.
+func (p *smallPg) CreateTechInspectionsTable(ctx context.Context) error {
+	ddl := `
+	CREATE TABLE IF NOT EXISTS tech_inspections (
+		pcv INT,
+		typ TEXT,
+		stav TEXT,
+		kod_stk INT,
+		nazev_stk TEXT,
+		platnost_od DATE,
+		platnost_do DATE,
+		cislo_protokolu TEXT,
+		aktualni BOOLEAN
+	);
+	CREATE INDEX IF NOT EXISTS tech_inspections_pcv_idx ON tech_inspections(pcv);`
+	_, err := p.conn.Exec(ctx, ddl)
+	return err
+}
+
+// CopyTechInspections performs COPY FROM into the tech_inspections table.
+//
+// It uses pgx.CopyFrom for high performance bulk inserts. If fewer rows are
+// reported as inserted than provided, a warning is logged (but the import
+// continues). This usually indicates one or more rows were rejected by
+// PostgreSQL due to type conversion issues (e.g., integer overflow or invalid date).
+func (p *smallPg) CopyTechInspections(ctx context.Context, rows [][]interface{}) error {
+	tx, err := p.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	n, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"tech_inspections"},
+		[]string{
+			"pcv",
+			"typ",
+			"stav",
+			"kod_stk",
+			"nazev_stk",
+			"platnost_od",
+			"platnost_do",
+			"cislo_protokolu",
+			"aktualni",
+		},
+		pgx.CopyFromRows(rows),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres CopyFrom tech_inspections: %w", err)
+	}
+
+	if n != int64(len(rows)) {
+		log.Printf("⚠️  postgres CopyFrom(tech_inspections): inserted %d of %d rows — some rows were rejected", n, len(rows))
+		// Print offending records for debugging.
+		start := len(rows) - int(len(rows)-int(n))
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(rows); i++ {
+			log.Printf("⚠️  rejected row #%d: %+v", i, rows[i])
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres commit tech_inspections: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying pgx.Conn.

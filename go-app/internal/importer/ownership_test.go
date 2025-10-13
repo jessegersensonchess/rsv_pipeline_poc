@@ -90,6 +90,14 @@ func (f *fakeSmallDB) Close(_ context.Context) error {
 	return nil
 }
 
+func (f *fakeSmallDB) CopyTechInspections(ctx context.Context, rows [][]interface{}) error {
+	// If you want visibility in those tests, you can count rows here.
+	// For tests that don't exercise tech inspections, a no-op is fine.
+	return nil
+}
+
+func (f *fakeSmallDB) CreateTechInspectionsTable(ctx context.Context) error { return nil }
+
 func fakeFactory(f *fakeSmallDB) db.SmallDBFactory {
 	return func(ctx context.Context) (db.SmallDB, error) { return f, nil }
 }

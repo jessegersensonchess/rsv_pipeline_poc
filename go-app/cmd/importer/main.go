@@ -18,6 +18,7 @@ import (
 	"csvloader/internal/config"
 	"csvloader/internal/db"
 	imp "csvloader/internal/importer"
+	ti "csvloader/internal/importer/techinspections"
 	vt "csvloader/internal/importer/vehicletech"
 )
 
@@ -32,8 +33,9 @@ type Deps struct {
 	NewSmallMSSQL func(dsn string) (db.SmallDB, error)
 
 	// Importers (top-level entrypoints for data loading)
-	ImportOwnership   func(ctx context.Context, cfg *config.Config, smallFactory db.SmallDBFactory, path string) error
-	ImportVehicleTech func(ctx context.Context, cfg *config.Config, factory db.DBFactory, path string) error
+	ImportOwnership      func(ctx context.Context, cfg *config.Config, smallFactory db.SmallDBFactory, path string) error
+	ImportVehicleTech    func(ctx context.Context, cfg *config.Config, factory db.DBFactory, path string) error
+	ImportTechInspection func(ctx context.Context, cfg *config.Config, smallFactory db.SmallDBFactory, path string) error
 
 	// Misc side-effects
 	Sleep func(d time.Duration)
@@ -49,8 +51,9 @@ func defaultDeps() Deps {
 		NewSmallMSSQL: db.NewSmallMSSQL,
 
 		// Real importers
-		ImportOwnership:   imp.ImportOwnershipParallel,
-		ImportVehicleTech: vt.ImportVehicleTech,
+		ImportOwnership:      imp.ImportOwnershipParallel,
+		ImportVehicleTech:    vt.ImportVehicleTech,
+		ImportTechInspection: ti.ImportTechInspectionsParallel,
 
 		// Real sleep
 		Sleep: time.Sleep,
@@ -104,6 +107,13 @@ func run(ctx context.Context, cfg *config.Config, deps Deps) error {
 	// Vehicle tech import (streaming DB interface)
 	if err := deps.ImportVehicleTech(ctx, cfg, factory, cfg.VehicleCSV); err != nil {
 		return fmt.Errorf("vehicle tech import failed: %w", err)
+	}
+
+	// Technical inspections import (small DB interface)
+	if cfg.TechInspectionsCSV != "" {
+		if err := deps.ImportTechInspection(ctx, cfg, smallFactory, cfg.TechInspectionsCSV); err != nil {
+			return fmt.Errorf("tech inspections import failed: %w", err)
+		}
 	}
 
 	return nil

@@ -29,6 +29,12 @@ type fakeSmallDB struct{}
 func (f *fakeSmallDB) CreateOwnershipTable(context.Context) error           { return nil }
 func (f *fakeSmallDB) CopyOwnership(context.Context, [][]interface{}) error { return nil }
 func (f *fakeSmallDB) Close(context.Context) error                          { return nil }
+func (f *fakeSmallDB) CopyTechInspections(ctx context.Context, rows [][]interface{}) error {
+	// If you want visibility in those tests, you can count rows here.
+	// For tests that don't exercise tech inspections, a no-op is fine.
+	return nil
+}
+func (f *fakeSmallDB) CreateTechInspectionsTable(ctx context.Context) error { return nil }
 
 // testCfg returns a baseline config used by most tests; individual tests
 // tweak fields (e.g., DBDriver/DSN) to exercise branches.
