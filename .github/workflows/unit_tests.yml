@@ -55,10 +55,12 @@ jobs:
 
       - name: Build
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -o ${{ env.binary }} go-app/cmd/importer.go
+          cd go-app
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} cmd/importer/main.go
 
       - name: Unit tests
         run: |
+          cd go-app
           go test -v ./...
 
 #      - name: Upload Artifacts
