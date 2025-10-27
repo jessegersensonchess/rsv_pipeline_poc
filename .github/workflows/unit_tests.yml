@@ -1,4 +1,4 @@
-name: Release
+name: Unit tests
 
 env:
   binary: csvimporter
@@ -16,40 +16,12 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
 
-#  increment-version:
-#    runs-on: ubuntu-latest
-#    outputs:
-#      new_version: ${{ steps.increment.outputs.new_version }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-#### versioning and releasing can be implemented in a later iteration 
-#      - name: Increment version
-#        id: increment
-#        run: |
-#          CURRENT_VERSION=$(cat VERSION_NUMBER)
-#          PR_TITLE="${{ github.event.pull_request.title }} coming soon"
-#          NEW_VERSION=$(cmd/version/version.sh -v "$CURRENT_VERSION" -t "$PR_TITLE")
-#          echo "Current Version: ${CURRENT_VERSION}"
-#          echo "Pull request title: ${PR_TITLE}"
-#          echo "NEW_VERSION: ${NEW_VERSION}"
-#          echo "${NEW_VERSION}" > VERSION_NUMBER
-#          # Output the new version to be used in subsequent steps
-#          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-#
-#      - name: Commit and push VERSION_NUMBER file
-#        if: steps.increment.outputs.new_version != ''
-#        run: |
-#          git config user.name "github-actions[bot]"
-#          git config user.email "github-actions[bot]@users.noreply.github.com"
-#          git add VERSION_NUMBER
-#          git commit -m "[ci] Bump version to $(cat VERSION_NUMBER)"
-#          git push
-#
       - name: Prepare a Go env
         uses: actions/setup-go@v5
         with:
@@ -66,27 +38,3 @@ jobs:
           cd go-app
           go test -v ./...
 
-#      - name: Upload Artifacts
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: ${{ env.binary }}
-#          path: ./${{ env.binary }}
-#
-#      - name: 'Create GitHub Release'
-#        id: create-new-release
-#        uses: actions/create-release@v1
-#        env:
-#          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-#        with:
-#          tag_name: v${{ steps.increment.outputs.new_version }}
-#          release_name: v${{ steps.increment.outputs.new_version }}
-#      - name: Upload asset to Github Release
-#        uses: actions/upload-release-asset@v1
-#        env:
-#          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-#        with:
-#          upload_url: ${{ steps.create-new-release.outputs.upload_url }}
-#          asset_path: ${{ env.binary }}
-#          asset_name: ${{ env.binary }}
-#          asset_content_type: application/octet-stream
-#
