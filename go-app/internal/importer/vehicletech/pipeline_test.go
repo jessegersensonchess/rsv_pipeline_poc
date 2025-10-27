@@ -30,7 +30,7 @@ func Test_newVehicleTechPipeline_ConfigAndFactory(t *testing.T) {
 		if !p.isPG {
 			t.Fatalf("isPG should be true")
 		}
-		if p.parserWorkers != cfg.Workers || p.encoderWorkers != max(8, cfg.Workers/2) || p.initialWriters != max(8, cfg.Workers/4) {
+		if p.parserWorkers != cfg.Workers || p.encoderWorkers != max(4, cfg.Workers/2) || p.initialWriters != max(4, cfg.Workers/4) {
 			t.Fatalf("unexpected worker derivation: parsers=%d encoders=%d writers=%d", p.parserWorkers, p.encoderWorkers, p.initialWriters)
 		}
 		if got := int(p.activeWriters.Load()); got != p.initialWriters {

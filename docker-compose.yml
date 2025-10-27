@@ -87,6 +87,7 @@ services:
         sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable
       OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
       VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
+      TECH_CSV:   /data/RSV_technicke_prohlidky_20250902.csv
       WORKERS: 8
       BATCH_SIZE: 2500
     volumes:
@@ -97,6 +98,7 @@ services:
         "--db-driver=mssql",
         "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable",
         "--vehicle-csv=/data/RSV_vypis_vozidel_20250902.csv",
+        "--tech_csv=/data/RSV_vypis_vozidel_20250902.csv",
         "--ownership-csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv"
       ]
 
@@ -119,6 +121,7 @@ services:
         postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable
       OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
       VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
+      TECH_CSV:   /data/RSV_technicke_prohlidky_20250902.csv
       WORKERS: 8
       BATCH_SIZE: 2500
     volumes:
@@ -178,33 +181,35 @@ services:
 #        "--vehicle_csv=/data/RSV_vypis_vozidel_20250902.csv"
 #      ]
 #
-#  # ---------------- C# App (imports CSV -> MSSQL) ----------------
-#  cs-app-mssql:
-#    build:
-#      context: ./cs-app
-#      dockerfile: Dockerfile
-#      network: host
-#    container_name: cs-app-mssql
-#    profiles: ["mssql"]
-#    depends_on:
-#      mssql:
-#        condition: service_healthy
-#    environment:
-#      TZ: ${TZ:-Europe/Prague}
-#      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
-#      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
-#      WORKERS: 8
-#      BATCH_SIZE: 1000
-#    volumes:
-#      - ./data:/data:ro
-#    command:
-#      [
-#        "--db_driver=mssql",
-#        "--dsn", "Server=mssql,1433;Database=${MSSQL_DB:-MyDb};User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True",
-#        "--ownership_csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv",
-#        "--vehicle_csv=/data/RSV_vypis_vozidel_20250902.csv"
-#      ]
-#
+  # ---------------- C# App (imports CSV -> MSSQL) ----------------
+  cs-app-mssql:
+    build:
+      context: ./cs-app
+      dockerfile: Dockerfile
+      network: host
+    container_name: cs-app-mssql
+    profiles: ["mssql"]
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
+      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
+      WORKERS: 1
+      BATCH_SIZE: 1000
+    volumes:
+      - ./data:/data:ro
+    command:
+      [
+        "--db_driver=mssql",
+        "--dsn", "Server=mssql,1433;Database=${MSSQL_DB:-MyDb};User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True",
+        "--ownership_csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv",
+        "--ownership_workers=1",
+        "--tech_worker=1",
+        "--vehicle_csv=/data/RSV_vypis_vozidel_20250902.csv"
+      ]
+
 
 volumes:
   pgdata:

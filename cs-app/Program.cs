@@ -39,8 +39,8 @@ sealed class Config
     public string DBName       = Env("DB_NAME", "testdb");
 
     // Import
-    public int OwnershipWorkers = Int("OWNERSHIP_WORKERS", 8);
-    public int TechWorkers      = Int("TECH_WORKERS", 4);
+    public int OwnershipWorkers = Int("OWNERSHIP_WORKERS", 1);
+    public int TechWorkers      = Int("TECH_WORKERS", 1);
     public int BatchSize        = Int("BATCH_SIZE", 1_000);
     public int FlushMs          = Int("FLUSH_MS", 250); // time-based flush in ms
 
@@ -1043,9 +1043,21 @@ static class OwnershipPipeline
         while (!ct.IsCancellationRequested)
         {
             var readTask = reader.WaitToReadAsync(ct).AsTask();
-            var tickTask = timer.WaitForNextTickAsync(ct).AsTask();
+//            var tickTask = timer.WaitForNextTickAsync(ct).AsTask();
 
-            var completed = await Task.WhenAny(readTask, tickTask).ConfigureAwait(false);
+			Task<bool> tickTask;
+
+			try
+			{
+				tickTask = timer.WaitForNextTickAsync(ct).AsTask();
+			}
+			catch (InvalidOperationException)
+			{
+				// Timer has completed, exit loop
+				break;
+			}
+
+			var completed = await Task.WhenAny(readTask, tickTask).ConfigureAwait(false);
 
             if (completed == readTask && await readTask.ConfigureAwait(false))
             {

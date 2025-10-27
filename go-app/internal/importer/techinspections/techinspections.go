@@ -117,6 +117,8 @@ func inOpenQuotedField(s string) bool {
 //
 // Returns the first non-nil error encountered by any worker, or nil on success.
 func ImportTechInspectionsParallel(ctx context.Context, cfg *config.Config, smallFactory db.SmallDBFactory, path string) error {
+	start := time.Now() // track total import duration
+
 	// Ensure target table exists before any worker starts.
 	ctrl, err := smallFactory(ctx)
 	if err != nil {
@@ -317,8 +319,10 @@ func ImportTechInspectionsParallel(ctx context.Context, cfg *config.Config, smal
 		return firstErr
 	}
 
+	duration := time.Since(start)
+
 	log.Printf(
-		"tech_inspections: parallel=%d produced=%d seen=%d inserted=%d skipped=%d repair_warnings=%d reasons=%v",
+		"tech_inspections: parallel=%d produced=%d seen=%d inserted=%d skipped=%d repair_warnings=%d reasons=%v, duration=%s",
 		workers,
 		atomic.LoadInt64(&produced),
 		totalSeen,
@@ -326,6 +330,7 @@ func ImportTechInspectionsParallel(ctx context.Context, cfg *config.Config, smal
 		totalSkipped,
 		atomic.LoadInt64(&repairWarns),
 		reasonAgg,
+		duration.Round(time.Millisecond),
 	)
 	return nil
 }

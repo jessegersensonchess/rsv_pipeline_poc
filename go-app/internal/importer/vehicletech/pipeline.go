@@ -102,9 +102,9 @@ func newVehicleTechPipeline(ctx context.Context, cfg *config.Config, factory db.
 		encodedCh:      make(chan encodedJob, 8*1024),
 		errCh:          make(chan error, 4),
 		parserWorkers:  cfg.Workers,
-		encoderWorkers: max(8, cfg.Workers/2), // was 1
-		initialWriters: max(8, cfg.Workers/4), // was 1
-		maxWriters:     max(9, cfg.Workers),
+		encoderWorkers: max(4, cfg.Workers/2), // was 1
+		initialWriters: max(4, cfg.Workers/4), // was 1
+		maxWriters:     max(8, cfg.Workers),
 		digitsOnly:     regexp.MustCompile(`^\d+$`),
 	}
 	// Default production backends:
@@ -312,6 +312,7 @@ func (p *VehicleTechPipeline) waitCloseStats(statsCh chan writerStats) (totalIns
 }
 
 func ImportVehicleTech(ctx context.Context, cfg *config.Config, factory db.DBFactory, path string) error {
+	start := time.Now()
 	// Ensure table
 	db, err := factory(ctx)
 	if err != nil {
@@ -385,10 +386,12 @@ func ImportVehicleTech(ctx context.Context, cfg *config.Config, factory db.DBFac
 	for k, v := range reasons {
 		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
 	}
+	duration := time.Since(start)
+
 	log.Printf(
-		"vehicle_tech (pipeline: parsers=%d encoders=%d writers=%d): inserted=%d skipped=%d (%s)",
+		"vehicle_tech (pipeline: parsers=%d encoders=%d writers=%d): inserted=%d skipped=%d (%s), duration=%s",
 		p.parserWorkers, p.encoderWorkers, int(p.activeWriters.Load()),
-		inserted, skipped, strings.Join(parts, ", "),
+		inserted, skipped, strings.Join(parts, ", "), duration.Round(time.Millisecond),
 	)
 
 	return nil

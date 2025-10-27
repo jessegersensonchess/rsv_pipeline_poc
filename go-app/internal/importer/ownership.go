@@ -88,6 +88,7 @@ func parseRecord(fields []string) (*domain.Record, error) {
 // ImportOwnershipParallel ingests ownership CSV using N workers and SmallDB batches.
 // It remains storage-agnostic by depending only on SmallDBFactory/SmallDB.
 func ImportOwnershipParallel(ctx context.Context, cfg *config.Config, smallFactory db.SmallDBFactory, path string) error {
+	start := time.Now()
 	// Ensure table using a short-lived control instance
 	ctrl, err := smallFactory(ctx)
 	if err != nil {
@@ -267,8 +268,10 @@ func ImportOwnershipParallel(ctx context.Context, cfg *config.Config, smallFacto
 	for k, v := range reasonAgg {
 		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
 	}
-	log.Printf("ownership (parallel %d): inserted=%d skipped=%d (%s)",
-		workers, totalInserted, totalSkipped, strings.Join(parts, ", "))
+	duration := time.Since(start)
+
+	log.Printf("ownership (parallel %d): inserted=%d skipped=%d (%s), duration=%s",
+		workers, totalInserted, totalSkipped, strings.Join(parts, ", "), duration.Round(time.Millisecond))
 
 	return nil
 }
