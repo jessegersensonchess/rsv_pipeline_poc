@@ -387,11 +387,12 @@ func ImportVehicleTech(ctx context.Context, cfg *config.Config, factory db.DBFac
 		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
 	}
 	duration := time.Since(start)
+	processingRate := float64(inserted) / duration.Seconds()
 
 	log.Printf(
-		"vehicle_tech (pipeline: parsers=%d encoders=%d writers=%d): inserted=%d skipped=%d (%s), duration=%s",
+		"vehicle_tech (pipeline: parsers=%d encoders=%d writers=%d): inserted=%d skipped=%d (%s), duration=%s, rate_per_second=%.0f",
 		p.parserWorkers, p.encoderWorkers, int(p.activeWriters.Load()),
-		inserted, skipped, strings.Join(parts, ", "), duration.Round(time.Millisecond),
+		inserted, skipped, strings.Join(parts, ", "), duration.Round(time.Millisecond), processingRate,
 	)
 
 	return nil

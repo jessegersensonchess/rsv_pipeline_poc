@@ -321,8 +321,10 @@ func ImportTechInspectionsParallel(ctx context.Context, cfg *config.Config, smal
 
 	duration := time.Since(start)
 
+	processingRate := float64(totalInserted) / duration.Seconds()
+
 	log.Printf(
-		"tech_inspections: parallel=%d produced=%d seen=%d inserted=%d skipped=%d repair_warnings=%d reasons=%v, duration=%s",
+		"tech_inspections: parallel=%d produced=%d seen=%d inserted=%d skipped=%d repair_warnings=%d reasons=%v, duration=%s, rate_per_second=%.0f",
 		workers,
 		atomic.LoadInt64(&produced),
 		totalSeen,
@@ -331,6 +333,7 @@ func ImportTechInspectionsParallel(ctx context.Context, cfg *config.Config, smal
 		atomic.LoadInt64(&repairWarns),
 		reasonAgg,
 		duration.Round(time.Millisecond),
+		processingRate,
 	)
 	return nil
 }

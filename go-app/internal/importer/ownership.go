@@ -269,9 +269,10 @@ func ImportOwnershipParallel(ctx context.Context, cfg *config.Config, smallFacto
 		parts = append(parts, fmt.Sprintf("%s=%d", k, v))
 	}
 	duration := time.Since(start)
+	processingRate := float64(totalInserted) / duration.Seconds()
 
-	log.Printf("ownership (parallel %d): inserted=%d skipped=%d (%s), duration=%s",
-		workers, totalInserted, totalSkipped, strings.Join(parts, ", "), duration.Round(time.Millisecond))
+	log.Printf("ownership (parallel %d): inserted=%d skipped=%d (%s), duration=%s, rate_per_second=%.0f",
+		workers, totalInserted, totalSkipped, strings.Join(parts, ", "), duration.Round(time.Millisecond), processingRate)
 
 	return nil
 }
