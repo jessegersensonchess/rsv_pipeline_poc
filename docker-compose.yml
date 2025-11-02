@@ -153,6 +153,18 @@ services:
       go tool cover -func=coverage.out
     "]
 
+  # ---------------- linediff (set-based CSV diff helper) ----------------
+  linediff:
+    build:
+      context: ./go-app
+      dockerfile: Dockerfile-linediff
+    container_name: linediff
+    profiles: ["tools", "linediff"]
+    volumes:
+      - ./data:/data:ro    # read your CSVs from ./data on host
+    working_dir: /data     # user can reference files directly
+    entrypoint: ["/linediff"]  # built binary inside container
+
 #  # ---------------- C# App (imports CSV -> Postgres) ----------------
 #  cs-app-postgres:
 #    build:
