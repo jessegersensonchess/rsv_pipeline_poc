@@ -458,64 +458,6 @@ func alignEnd(r ReaderAt, tmpSz int, filesz int64, end *int64) error {
 	return nil
 }
 
-// readAndProcessLines reads and processes lines from the file into the output buffer.
-func XXreadAndProcessLines(
-	r ReaderAt,
-	buf []byte,
-	carry *[]byte,
-	pos, end int64,
-	idx *Index16,
-	stripCRLF bool,
-	out *[]byte,
-	flushSz int,
-	flush func() error,
-) (int, error) {
-	toRead := len(buf)
-	if rem := int(end - pos); rem < toRead {
-		toRead = rem
-	}
-
-	n, err := r.ReadAt(buf[:toRead], pos)
-	if n > 0 {
-		data := buf[:n]
-		if len(*carry) > 0 {
-			*carry = append(*carry, data...)
-			data = *carry
-		}
-
-		// Process each line
-		start := 0
-		for i, c := range data {
-			if c == '\n' {
-				line := data[start:i]
-				if len(line) != 0 {
-					line = stripCR(line, stripCRLF)
-					h := hash48b(line)
-					if !idx.Contains(h) {
-						*out = append(*out, line...)
-						*out = append(*out, '\n')
-						if len(*out) >= flushSz {
-							if err := flush(); err != nil {
-								return n, err
-							}
-						}
-					}
-				}
-				start = i + 1
-			}
-		}
-
-		// Handle carryover bytes
-		if start < len(data) {
-			*carry = append((*carry)[:0], data[start:]...)
-		} else {
-			*carry = (*carry)[:0]
-		}
-	}
-	return n, err
-}
-
-// --- main.go (after) ---
 func scanRange(
 	r ReaderAt,
 	filesz int64,
@@ -1071,7 +1013,6 @@ func main() {
 			for rg := range jobs {
 				// f2 is *os.File, which already implements ReaderAt
 				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz, nil); err != nil {
-					//				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz); err != nil {
 					wmu.Lock()
 					fmt.Fprintf(os.Stderr, "scanRange error [%d..%d): %v\n", rg.start, rg.end, err)
 					wmu.Unlock()
