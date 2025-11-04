@@ -77,17 +77,14 @@ services:
     depends_on:
       mssql:
         condition: service_healthy
-    # initialization control is now in scripts/run_import_mssql.sh
-    # mssql-init:
-    #    condition: service_completed_successfully
     environment:
       TZ: ${TZ:-Europe/Prague}
       DB_DRIVER: mssql
       DB_DSN: >-
         sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable
-      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
-      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
-      TECH_CSV:   /data/RSV_technicke_prohlidky_20250902.csv
+      VEHICLE_CSV:   /data/RSV_vypis_vozidel.csv
+      TECH_CSV:   /data/RSV_technicke_prohlidky.csv
+      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla.csv
       WORKERS: 8
       BATCH_SIZE: 2500
     volumes:
@@ -97,9 +94,9 @@ services:
         "/app/main",
         "--db-driver=mssql",
         "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable",
-        "--vehicle-csv=/data/RSV_vypis_vozidel_20250902.csv",
-        "--tech_csv=/data/RSV_vypis_vozidel_20250902.csv",
-        "--ownership-csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv"
+        "--vehicle-csv=/data/RSV_vypis_vozidel.csv",
+        "--tech_csv=/data/RSV_technicke_prohlidky.csv",
+        "--ownership-csv=/data/RSV_vlastnik_provozovatel_vozidla.csv"
       ]
 
   # ---------------- Go App (imports CSV -> Postgres) ----------------
@@ -119,20 +116,18 @@ services:
       # Env fallback (your app can read this if flags are ignored)
       DB_DSN: >-
         postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable
-      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
-      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
-      TECH_CSV:   /data/RSV_technicke_prohlidky_20250902.csv
+      VEHICLE_CSV:   /data/RSV_vypis_vozidel.csv
+      TECH_CSV:   /data/RSV_technicke_prohlidky.csv
+      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla.csv
       WORKERS: 8
-      BATCH_SIZE: 2500
+      BATCH_SIZE: 3000
     volumes:
       - ./data:/data:ro
     command:
       [
         "/app/main",
         "--db-driver=postgres",
-        "--dsn", "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable",
-        "--vehicle-csv=/data/RSV_vypis_vozidel_20250902.csv",
-        "--ownership-csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv"
+        "--dsn", "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable"
       ]
 
   # ---------------- Go Unit Tests ----------------

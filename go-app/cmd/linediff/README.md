@@ -19,7 +19,7 @@ It is designed for **speed, streaming, and low memory usage**:
 ```sh
 linediff -file1 old.csv -file2 new.csv > diff.csv
 
-linediff -flush=4194304 -workers 8 -block=524288 -file1 RSV_vypis_vozidel_20250902.csv -file2 RSV_vypis_vozidel_20251002.csv
+linediff -flush=262144 -workers 4 -block=262144 -file1 RSV_vypis_vozidel_20250902.csv -file2 RSV_vypis_vozidel_20251002.csv
 
 ## Build
 build a windows exe with:
