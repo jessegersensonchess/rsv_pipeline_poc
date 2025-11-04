@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -146,26 +145,31 @@ func TestScanRangeSimple(t *testing.T) {
 	data := "a\nb\nc\nd\ne\n"
 	r := &mockReaderAt{data: []byte(data)}
 
-	var out bytes.Buffer
-	wmu := sync.Mutex{}
-	flushSz := 8
+	// per-worker context and opts
+	wc := &WorkerCtx{
+		Buf: make([]byte, defaultBufSz),
+		Out: make([]byte, 0, 8),
+	}
+	opts := Opts{
+		StripCRLF: true,
+		FlushSz:   8,
+		BufSz:     defaultBufSz,
+		TmpSz:     defaultTmpSz,
+	}
 
-	err := scanRange(
+	out, err := scanRange(
 		r,
 		int64(len(data)),
 		fileRange{0, int64(len(data))},
 		idx,
-		&out,
-		&wmu,
-		true,
-		flushSz,
-		nil,
+		wc,
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("scanRange error: %v", err)
 	}
 
-	res := out.String()
+	res := string(out)
 	if res != "d\ne\n" {
 		t.Fatalf("unexpected out: %q", res)
 	}
@@ -180,25 +184,30 @@ func TestScanRangeUnterminatedFinalLine(t *testing.T) {
 	data := "foo\nbar"
 	r := &mockReaderAt{data: []byte(data)}
 
-	var out bytes.Buffer
-	wmu := sync.Mutex{}
+	wc := &WorkerCtx{
+		Buf: make([]byte, defaultBufSz),
+		Out: make([]byte, 0, 1024),
+	}
+	opts := Opts{
+		StripCRLF: true,
+		FlushSz:   1024,
+		BufSz:     defaultBufSz,
+		TmpSz:     defaultTmpSz,
+	}
 
-	err := scanRange(
+	out, err := scanRange(
 		r,
 		int64(len(data)),
 		fileRange{0, int64(len(data))},
 		idx,
-		&out,
-		&wmu,
-		true,
-		1024,
-		nil,
+		wc,
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("scanRange error: %v", err)
 	}
 
-	res := out.String()
+	res := string(out)
 	if res != "bar\n" {
 		t.Fatalf("expected bar\\n, got %q", res)
 	}
@@ -211,29 +220,35 @@ func TestScanRangeCRLF(t *testing.T) {
 	data := []byte("alpha\r\nbeta\r\n")
 	r := &mockReaderAt{data: data}
 
-	var out bytes.Buffer
-	wmu := sync.Mutex{}
+	wc := &WorkerCtx{
+		Buf: make([]byte, defaultBufSz),
+		Out: make([]byte, 0, 1024),
+	}
+	opts := Opts{
+		StripCRLF: true, // strip CR
+		FlushSz:   1024,
+		BufSz:     defaultBufSz,
+		TmpSz:     defaultTmpSz,
+	}
 
-	err := scanRange(
+	out, err := scanRange(
 		r,
 		int64(len(data)),
 		fileRange{0, int64(len(data))},
 		idx,
-		&out,
-		&wmu,
-		true, // strip CR
-		1024,
-		nil,
+		wc,
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("scanRange error: %v", err)
 	}
 
-	res := strings.TrimSpace(out.String())
+	res := strings.TrimSpace(string(out))
 	if res != "beta" {
 		t.Fatalf("expected beta, got %q", res)
 	}
 }
+
 func TestSplitRanges(t *testing.T) {
 	type args struct {
 		size   int64

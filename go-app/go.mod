@@ -8,6 +8,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/microsoft/go-mssqldb v1.9.3
 	github.com/zeebo/xxh3 v1.0.2
+	golang.org/x/sync v0.14.0
 	golang.org/x/sys v0.33.0
 )
 

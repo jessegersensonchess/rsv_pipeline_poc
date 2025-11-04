@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"sync"
 
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -458,7 +460,112 @@ func alignEnd(r ReaderAt, tmpSz int, filesz int64, end *int64) error {
 	return nil
 }
 
+// --- NEW: scanRange using per-worker context ---
+// Returns a slice containing the lines from rg that are NOT in idx.
+// The returned slice is safe for the caller to keep; the worker reuses its own buffers.
+
 func scanRange(
+	r ReaderAt,
+	filesz int64,
+	rg fileRange,
+	idx *Index16,
+	wc *WorkerCtx,
+	opts Opts,
+) ([]byte, error) {
+	opts = opts.withDefaults()
+
+	// Align boundaries to newlines
+	if err := alignStart(r, opts.TmpSz, &rg.start); err != nil && err != io.EOF {
+		return nil, err
+	}
+	if err := alignEnd(r, opts.TmpSz, filesz, &rg.end); err != nil && err != io.EOF {
+		return nil, err
+	}
+	if rg.start >= rg.end {
+		return nil, nil
+	}
+
+	buf := wc.Buf
+	out := wc.Out[:0]
+	wc.Carry = wc.Carry[:0]
+
+	pos := rg.start
+	for pos < rg.end {
+		toRead := len(buf)
+		if rem := int(rg.end - pos); rem < toRead {
+			toRead = rem
+		}
+		n, err := r.ReadAt(buf[:toRead], pos)
+		if n > 0 {
+			data := buf[:n]
+			if len(wc.Carry) > 0 {
+				wc.Carry = append(wc.Carry, data...)
+				data = wc.Carry
+			}
+
+			start := 0
+			for i, c := range data {
+				if c == '\n' {
+					line := data[start:i]
+					if len(line) != 0 {
+						if opts.StripCRLF && line[len(line)-1] == '\r' {
+							line = line[:len(line)-1]
+						}
+						if len(line) != 0 {
+							if !idx.Contains(hash48b(line)) {
+								out = append(out, line...)
+								out = append(out, '\n')
+								// Optional: local flush threshold to cap peak Out size
+								//								if len(out) >= opts.FlushSz {
+								// hand off partial chunk by copying into a fresh slice
+								// (caller will aggregate; we keep out small)
+								// We'll finish the copy in the worker loop to avoid many tiny chunks here.
+								//								}
+							}
+						}
+					}
+					start = i + 1
+				}
+			}
+			if start < len(data) {
+				wc.Carry = append(wc.Carry[:0], data[start:]...)
+			} else {
+				wc.Carry = wc.Carry[:0]
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		pos += int64(n)
+	}
+
+	// Final unterminated line
+	if len(wc.Carry) > 0 {
+		line := wc.Carry
+		if opts.StripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) != 0 && !idx.Contains(hash48b(line)) {
+			out = append(out, line...)
+			out = append(out, '\n')
+		}
+	}
+
+	// Hand off ownership: copy to a fresh slice so the worker can reuse its buffer next task.
+	if len(out) == 0 {
+		return nil, nil
+	}
+	result := make([]byte, len(out))
+	copy(result, out)
+	// keep grown capacity for reuse
+	wc.Out = out[:0]
+	return result, nil
+}
+
+func XXXscanRange(
 	r ReaderAt,
 	filesz int64,
 	rg fileRange,
@@ -905,6 +1012,164 @@ func buildIndex16Parallel(path string, stripCRLF bool, workers int, minBlk int64
 	return &Index16{off: off, data: data}, nil
 }
 
+// --- NEW: options and per-worker scratch ---
+
+type Opts struct {
+	StripCRLF bool
+	FlushSz   int // per-chunk flush threshold for workers (not shared writer buf)
+	BufSz     int // read buffer
+	TmpSz     int // alignment scratch
+}
+
+func (o *Opts) withDefaults() Opts {
+	out := *o
+	if out.BufSz == 0 {
+		out.BufSz = defaultBufSz
+	}
+	if out.TmpSz == 0 {
+		out.TmpSz = defaultTmpSz
+	}
+	if out.FlushSz == 0 {
+		out.FlushSz = defaultOutputFlushSz
+	}
+	return out
+}
+
+type WorkerCtx struct {
+	Buf   []byte // read buffer
+	Carry []byte // partial line across reads
+	Out   []byte // reusable output buffer
+}
+
+var workerPool = sync.Pool{
+	New: func() any {
+		return &WorkerCtx{
+			Buf: make([]byte, defaultBufSz),
+			Out: make([]byte, 0, defaultOutputFlushSz),
+		}
+	},
+}
+
+// runFile2 processes file2 with worker pool producing []byte chunks and a single
+// writer goroutine that batches to stdout. Avoids deadlock by closing `results`
+// when (and only when) the workers are done.
+func runFile2(f2 *os.File, idx *Index16, workers int, minBlk int64, opts Opts) error {
+	opts = opts.withDefaults()
+
+	// Split work
+	st2, err := f2.Stat()
+	if err != nil {
+		return fmt.Errorf("stat file2: %w", err)
+	}
+	filesz := st2.Size()
+
+	ranges, err := splitRanges(f2, workers*32, minBlk)
+	if err != nil {
+		return fmt.Errorf("split ranges: %w", err)
+	}
+
+	type result struct {
+		data []byte
+		err  error
+	}
+
+	jobs := make(chan fileRange, len(ranges))
+	results := make(chan result, workers*2)
+
+	for _, rg := range ranges {
+		jobs <- rg
+	}
+	close(jobs)
+
+	// One errgroup for the writer (provides cancellation context).
+	gWriter, ctx := errgroup.WithContext(context.Background())
+
+	// Writer goroutine: only place that touches stdout.
+	gWriter.Go(func() error {
+		bw := bufio.NewWriterSize(os.Stdout, writeBufSize)
+		defer bw.Flush()
+
+		// Emit header once (best-effort).
+		if name := f2.Name(); name != "" {
+			if fh, e := os.Open(name); e == nil {
+				br := bufio.NewReader(fh)
+				if header, e2 := br.ReadBytes('\n'); e2 == nil && len(header) > 0 {
+					if _, e3 := bw.Write(header); e3 != nil {
+						_ = fh.Close()
+						return e3
+					}
+				}
+				_ = fh.Close()
+			}
+		}
+
+		for r := range results {
+			if r.err != nil {
+				return r.err
+			}
+			if len(r.data) == 0 {
+				continue
+			}
+			if _, err := bw.Write(r.data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Separate group for workers. When workers are done, we close `results`.
+	gWorkers, _ := errgroup.WithContext(ctx) // inherit ctx for cancellation
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	// Optionally cap concurrency here:
+	// gWorkers.SetLimit(workers) // if you want to use more tasks than goroutines
+
+	for i := 0; i < workers; i++ {
+		gWorkers.Go(func() error {
+			wc := workerPool.Get().(*WorkerCtx)
+			defer workerPool.Put(wc)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case rg, ok := <-jobs:
+					if !ok {
+						return nil
+					}
+					data, err := scanRange(f2, filesz, rg, idx, wc, opts)
+					select {
+					case results <- result{data: data, err: err}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			}
+		})
+	}
+
+	// Close `results` when all workers finish (success or error).
+	done := make(chan struct{})
+	go func() {
+		_ = gWorkers.Wait() // ignore here; we return error below
+		close(results)
+		close(done)
+	}()
+
+	// Wait for writer to finish (it will stop on error or after results closes).
+	if err := gWriter.Wait(); err != nil && err != context.Canceled {
+		<-done // ensure results closer finished to avoid leaks
+		return err
+	}
+
+	// If writer was fine, check worker errors.
+	if err := gWorkers.Wait(); err != nil && err != context.Canceled {
+		return err
+	}
+	return nil
+}
+
 func main() {
 	// Flags:
 	//   -file1: baseline set of lines to compare against.
@@ -913,7 +1178,7 @@ func main() {
 	//   -block: minimum byte range per worker (tune for cache/L3).
 	//   -hash: "xxh3" (default).
 	//   -strip_crlf: if false, skips CR stripping (slightly faster on LF-only data).
-	//   -flush: per-worker flush size in bytes (reduces writer lock contention).
+	//   -flush: per-worker flush size in bytes (caps worker buffer growth).
 	file1 := flag.String("file1", "", "Path to the first file")
 	file2 := flag.String("file2", "", "Path to the second file")
 	workers := flag.Int("workers", runtime.NumCPU(), "Number of worker goroutines for file2 processing")
@@ -928,6 +1193,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
 	// Select hash implementation.
 	switch *hashAlg {
 	case "xxh3":
@@ -943,15 +1209,13 @@ func main() {
 	}
 
 	// Build compact index from file1 (memory ~4 bytes/line + ~512 KiB offsets).
-	// idx, err := buildIndex16(*file1, *stripCRLF)
 	idx, err := buildIndex16Parallel(*file1, *stripCRLF, *workers, int64(*blockSize))
-
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build index: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Open file2 and split into many small byte ranges (not breaking lines).
+	// Open file2; run the parallel scan+writer pipeline.
 	f2, err := os.Open(*file2)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open file2: %v\n", err)
@@ -963,67 +1227,23 @@ func main() {
 	_ = unix.Fadvise(int(f2.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
 	_ = unix.Fadvise(int(f2.Fd()), 0, 0, unix.FADV_WILLNEED)
 
-	// Oversubscribe ranges to enable work stealing: many more ranges than workers.
-	parts := *workers * 32
-	if parts < *workers {
-		parts = *workers
-	}
-	ranges, err := splitRanges(f2, parts, int64(*blockSize))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "split ranges: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Get file size once and pass it to workers (avoid per-worker Stat()).
-	st2, err := f2.Stat()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "stat file2: %v\n", err)
-		os.Exit(1)
-	}
-	filesz := st2.Size()
-
-	// Shared buffered writer with a small critical section per flush.
-	bw := bufio.NewWriterSize(os.Stdout, writeBufSize)
-
-	// always emit the first line of file2 (assumed CSV header)
-	f2h, err := os.Open(*file2)
-	if err != nil { /* ... */
-	}
-	r2 := bufio.NewReader(f2h)
-	header, err := r2.ReadBytes('\n')
-	if err == nil && len(header) > 0 {
-		bw.Write(header)
-	}
-	f2h.Close()
-
-	var wmu sync.Mutex
-
-	// Dynamic work-stealing pool: fixed number of workers consume many ranges.
-	jobs := make(chan fileRange, len(ranges))
-	for _, rg := range ranges {
-		jobs <- rg
-	}
-	close(jobs)
-
-	var wg sync.WaitGroup
-	wg.Add(*workers)
-	for w := 0; w < *workers; w++ {
-		go func() {
-			defer wg.Done()
-			for rg := range jobs {
-				// f2 is *os.File, which already implements ReaderAt
-				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz, nil); err != nil {
-					wmu.Lock()
-					fmt.Fprintf(os.Stderr, "scanRange error [%d..%d): %v\n", rg.start, rg.end, err)
-					wmu.Unlock()
-				}
-			}
-		}()
-	}
-	wg.Wait()
-
-	if err := bw.Flush(); err != nil {
-		fmt.Fprintf(os.Stderr, "flush: %v\n", err)
+	// Run the new pipeline. It:
+	//   * splits ranges,
+	//   * fans out to workers (with per-worker reusable buffers),
+	//   * funnels results to a single writer goroutine (batched stdout).
+	if err := runFile2(
+		f2,
+		idx,
+		*workers,
+		int64(*blockSize),
+		Opts{
+			StripCRLF: *stripCRLF,
+			FlushSz:   *flushSz,
+			BufSz:     defaultBufSz,
+			TmpSz:     defaultTmpSz,
+		},
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "file2 processing error: %v\n", err)
 		os.Exit(1)
 	}
 }

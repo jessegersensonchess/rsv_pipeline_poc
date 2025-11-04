@@ -227,9 +227,8 @@ func BenchmarkEndToEnd(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		bw := bufio.NewWriter(io.Discard) // measure compute + syscalls sans disk
-		var wmu sync.Mutex
-
+		// Parallel workers calling the new scanRange (returning []byte).
+		workers := runtime.GOMAXPROCS(0)
 		jobs := make(chan fileRange, len(ranges))
 		for _, rg := range ranges {
 			jobs <- rg
@@ -237,18 +236,34 @@ func BenchmarkEndToEnd(b *testing.B) {
 		close(jobs)
 
 		var wg sync.WaitGroup
-		workers := runtime.GOMAXPROCS(0)
 		wg.Add(workers)
 		for w := 0; w < workers; w++ {
 			go func() {
 				defer wg.Done()
+				// Per-worker context with reusable buffers
+				wc := &WorkerCtx{
+					Buf: make([]byte, defaultBufSz),
+					Out: make([]byte, 0, defaultOutputFlushSz),
+				}
+				opts := Opts{
+					StripCRLF: false,
+					FlushSz:   defaultOutputFlushSz,
+					BufSz:     defaultBufSz,
+					TmpSz:     defaultTmpSz,
+				}
 				for rg := range jobs {
-					_ = scanRange(f2h, filesz, rg, idx, bw, &wmu, false, defaultOutputFlushSz, nil)
+					out, err := scanRange(f2h, filesz, rg, idx, wc, opts)
+					_ = out // discard result in benchmark
+					if err != nil {
+						// Ignore errors in benchmark hot path; but fail if unexpected
+						if err != io.EOF {
+							b.Fatal(err)
+						}
+					}
 				}
 			}()
 		}
 		wg.Wait()
-		_ = bw.Flush()
 		_ = f2h.Close()
 	}
 }
