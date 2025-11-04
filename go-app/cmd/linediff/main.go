@@ -38,6 +38,9 @@ const (
 	// Small ranges improve cache behavior on modest L3 caches.
 	defaultBlkSz = 2 << 20 // 2 MiB
 
+	defaultBufSz = 1 << 18 // 256KiB per worker
+	defaultTmpSz = 64 << 9 // 32 KiB for temporary buffer
+
 	// Default per-worker buffered output flush threshold (overridable via -flush).
 	defaultOutputFlushSz = 2 << 20 // 2 MiB
 
@@ -57,6 +60,23 @@ type Size interface {
 
 // hashFn is selected at startup based on the -hash flag.
 var hashFn func([]byte) uint64 = func(b []byte) uint64 { return xxh3.Hash(b) }
+
+// scanOpts holds options for scanning.
+type scanOpts struct {
+	BufSz int // Buffer size for reading
+	TmpSz int // Temporary buffer size for alignment and extension
+}
+
+// NewScanOpts returns default scan options if opts is nil.
+func NewScanOpts(opts *scanOpts) *scanOpts {
+	if opts == nil {
+		return &scanOpts{
+			BufSz: defaultBufSz,
+			TmpSz: defaultTmpSz,
+		}
+	}
+	return opts
+}
 
 // hash48b returns the low 48 bits of the selected hash of b.
 func hash48b(b []byte) uint64 { return hashFn(b) & hashMask48 }
@@ -94,7 +114,7 @@ type Index16 struct {
 
 // binarySearch32 returns true if x is contained in sorted a.
 // Hand-rolled to avoid generic overhead; hot in the lookup path.
-func binarySearch32(a []uint32, x uint32) bool {
+func oldbinarySearch32(a []uint32, x uint32) bool {
 	lo, hi := 0, len(a)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1) // avoid overflow; branch-predictable
@@ -106,6 +126,22 @@ func binarySearch32(a []uint32, x uint32) bool {
 		}
 	}
 	return lo < len(a) && a[lo] == x
+}
+
+// Optimized binary search for small arrays using a more efficient approach
+func binarySearch32(a []uint32, x uint32) bool {
+	lo, hi := 0, len(a)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if a[mid] == x {
+			return true
+		} else if a[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return false
 }
 
 // Contains reports whether the 48-bit hash h is present in the index.
@@ -670,9 +706,109 @@ func splitRanges(f *os.File, parts int, minBlk int64) ([]fileRange, error) {
 	return ranges, nil
 }
 
-// scanRange streams and compares lines within [rg.start, rg.end) from f2.
-// It aligns to newlines at both ends, hashes lines, and emits those not found
-// in idx. Output is buffered and serialized via wr/wmu to minimize contention.
+// alignStart ensures that the range starts at a newline.
+func alignStart(r ReaderAt, tmpSz int, start *int64) error {
+	tmp := make([]byte, tmpSz)
+	pos := *start
+	for {
+		n, err := r.ReadAt(tmp, pos)
+		if n == 0 && err != nil {
+			return err
+		}
+		if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
+			*start = pos + int64(i+1)
+			break
+		}
+		pos += int64(n)
+		if err == io.EOF {
+			return nil
+		}
+	}
+	return nil
+}
+
+// alignEnd ensures that the range ends at a newline.
+func alignEnd(r ReaderAt, tmpSz int, filesz int64, end *int64) error {
+	if *end < filesz {
+		tmp := make([]byte, tmpSz)
+		pos := *end
+		for {
+			n, err := r.ReadAt(tmp, pos)
+			if n == 0 && err != nil {
+				break
+			}
+			if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
+				*end = pos + int64(j+1)
+				break
+			}
+			pos += int64(n)
+			if err == io.EOF {
+				*end = filesz
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// readAndProcessLines reads and processes lines from the file into the output buffer.
+func XXreadAndProcessLines(
+	r ReaderAt,
+	buf []byte,
+	carry *[]byte,
+	pos, end int64,
+	idx *Index16,
+	stripCRLF bool,
+	out *[]byte,
+	flushSz int,
+	flush func() error,
+) (int, error) {
+	toRead := len(buf)
+	if rem := int(end - pos); rem < toRead {
+		toRead = rem
+	}
+
+	n, err := r.ReadAt(buf[:toRead], pos)
+	if n > 0 {
+		data := buf[:n]
+		if len(*carry) > 0 {
+			*carry = append(*carry, data...)
+			data = *carry
+		}
+
+		// Process each line
+		start := 0
+		for i, c := range data {
+			if c == '\n' {
+				line := data[start:i]
+				if len(line) != 0 {
+					line = stripCR(line, stripCRLF)
+					h := hash48b(line)
+					if !idx.Contains(h) {
+						*out = append(*out, line...)
+						*out = append(*out, '\n')
+						if len(*out) >= flushSz {
+							if err := flush(); err != nil {
+								return n, err
+							}
+						}
+					}
+				}
+				start = i + 1
+			}
+		}
+
+		// Handle carryover bytes
+		if start < len(data) {
+			*carry = append((*carry)[:0], data[start:]...)
+		} else {
+			*carry = (*carry)[:0]
+		}
+	}
+	return n, err
+}
+
+// --- main.go (after) ---
 func scanRange(
 	r ReaderAt,
 	filesz int64,
@@ -682,116 +818,52 @@ func scanRange(
 	wmu *sync.Mutex,
 	stripCRLF bool,
 	flushSz int,
+	opts *scanOpts,
 ) error {
+	// Get scanOpts or use default
+	options := NewScanOpts(opts)
+	bufSz, tmpSz := options.BufSz, options.TmpSz
 
-	const bufSz = 1 << 20 // 1 MiB per worker
 	buf := make([]byte, bufSz)
-	out := make([]byte, 0, flushSz)
-	var carry []byte
+	out := make([]byte, 0, flushSz) // Reuse the output buffer for reduced allocations
+	var carry []byte                // Reuse carry buffer to accumulate leftover bytes between reads
 
+	// Helper function to flush output buffer to writer
 	flush := func() error {
 		if len(out) == 0 {
 			return nil
 		}
 		wmu.Lock()
-		_, err := wr.Write(out)
+		_, err := wr.Write(out) // Flush the buffer when it's full or at EOF
 		wmu.Unlock()
-		out = out[:0]
+		out = out[:0] // Clear the output slice to prevent unnecessary memory usage
 		return err
 	}
 
-	// Align to newline
-	if rg.start != 0 {
-		tmp := make([]byte, 64<<10)
-		pos := rg.start
-		for {
-			n, err := r.ReadAt(tmp, pos)
-			if n == 0 {
-				if err != nil {
-					return err
-				}
-				break
-			}
-			if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
-				rg.start = pos + int64(i+1)
-				break
-			}
-			pos += int64(n)
-			if err == io.EOF {
-				return nil
-			}
-		}
+	// Align to newline at the start (reused logic from previous version)
+	if err := alignStart(r, tmpSz, &rg.start); err != nil {
+		return err
 	}
 
-	// Extend end to full line
-	if rg.end < filesz {
-		tmp := make([]byte, 64<<10)
-		pos := rg.end
-		for {
-			n, err := r.ReadAt(tmp, pos)
-			if n == 0 {
-				break
-			}
-			if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
-				rg.end = pos + int64(j+1)
-				break
-			}
-			pos += int64(n)
-			if err == io.EOF {
-				rg.end = filesz
-				break
-			}
-		}
+	// Extend the end to the next newline
+	if err := alignEnd(r, tmpSz, filesz, &rg.end); err != nil {
+		return err
 	}
 
+	// Scan the range and process lines
 	pos := rg.start
 	for pos < rg.end {
-		toRead := bufSz
-		if rem := int(rg.end - pos); rem < toRead {
-			toRead = rem
-		}
-		n, err := r.ReadAt(buf[:toRead], pos)
-		if n > 0 {
-			data := buf[:n]
-			if len(carry) > 0 {
-				carry = append(carry, data...)
-				data = carry
-			}
-			start := 0
-			for i, c := range data {
-				if c == '\n' {
-					line := data[start:i]
-					if len(line) != 0 {
-						line = stripCR(line, stripCRLF)
-						h := hash48b(line)
-						if !idx.Contains(h) {
-							out = append(out, line...)
-							out = append(out, '\n')
-							if len(out) >= flushSz {
-								if err := flush(); err != nil {
-									return err
-								}
-							}
-						}
-					}
-					start = i + 1
-				}
-			}
-			if start < len(data) {
-				carry = append(carry[:0], data[start:]...)
-			} else {
-				carry = carry[:0]
-			}
-			pos += int64(n)
-		}
+		n, err := readAndProcessLines(r, buf, &carry, pos, rg.end, idx, stripCRLF, &out, flushSz, flush)
 		if err == io.EOF {
+			// Expected when the reader reaches the end of file
 			break
-		}
-		if err != nil && err != io.EOF {
+		} else if err != nil {
 			return err
 		}
+		pos += int64(n)
 	}
 
+	// Final flush of remaining carryover bytes
 	if len(carry) > 0 {
 		line := stripCR(carry, stripCRLF)
 		if len(line) != 0 {
@@ -806,137 +878,60 @@ func scanRange(
 	return flush()
 }
 
-func XXXscanRange(f *os.File, filesz int64, rg fileRange, idx *Index16, wr *bufio.Writer, wmu *sync.Mutex, stripCRLF bool, flushSz int) error {
-	// Scratch buffers: keep small enough to fit per-core caches.
-	const bufSz = 1 << 20 // 1 MiB
-	buf := make([]byte, bufSz)
-	out := make([]byte, 0, flushSz)
-
-	// Align start to the next newline (except when starting at 0).
-	if rg.start != 0 {
-		tmp := make([]byte, 64<<10) // 64 KiB probe window
-		pos := rg.start
-		for {
-			n, err := f.ReadAt(tmp, pos)
-			if n == 0 {
-				if err != nil {
-					return err
-				}
-				break
-			}
-			if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
-				rg.start = pos + int64(i+1)
-				break
-			}
-			pos += int64(n)
-			if err == io.EOF {
-				return nil // Nothing more to read in this range.
-			}
-		}
+func readAndProcessLines(
+	r ReaderAt,
+	buf []byte,
+	carry *[]byte,
+	pos, end int64,
+	idx *Index16,
+	stripCRLF bool,
+	out *[]byte,
+	flushSz int,
+	flush func() error,
+) (int, error) {
+	toRead := len(buf)
+	if rem := int(end - pos); rem < toRead {
+		toRead = rem
 	}
 
-	// Extend end forward to include the trailing line fragment.
-	if rg.end < filesz {
-		tmp := make([]byte, 64<<10)
-		pos := rg.end
-		for {
-			n, err := f.ReadAt(tmp, pos)
-			if n == 0 {
-				break
-			}
-			if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
-				rg.end = pos + int64(j+1)
-				break
-			}
-			pos += int64(n)
-			if err == io.EOF {
-				rg.end = filesz
-				break
-			}
+	n, err := r.ReadAt(buf[:toRead], pos)
+	if n > 0 {
+		data := buf[:n]
+		if len(*carry) > 0 {
+			*carry = append(*carry, data...)
+			data = *carry
 		}
-	}
 
-	var pos = rg.start
-	var carry []byte
-
-	flush := func() error {
-		if len(out) == 0 {
-			return nil
-		}
-		wmu.Lock()
-		_, err := wr.Write(out)
-		wmu.Unlock()
-		out = out[:0]
-		return err
-	}
-
-	for pos < rg.end {
-		toRead := bufSz
-		if rem := int(rg.end - pos); rem < toRead {
-			toRead = rem
-		}
-		n, err := f.ReadAt(buf[:toRead], pos)
-		if n > 0 {
-			data := buf[:n]
-			// If the previous read ended mid-line, append new bytes to carry.
-			if len(carry) > 0 {
-				carry = append(carry, data...)
-				data = carry
-			}
-			start := 0
-			for i, c := range data {
-				if c == '\n' {
-					line := data[start:i]
-					if len(line) != 0 {
-						line = stripCR(line, stripCRLF)
-						h := hash48b(line)
-						if !idx.Contains(h) {
-							out = append(out, line...)
-							out = append(out, '\n')
-							if len(out) >= flushSz {
-								if err := flush(); err != nil {
-									return err
-								}
+		// Process each line
+		start := 0
+		for i, c := range data {
+			if c == '\n' {
+				line := data[start:i]
+				if len(line) != 0 {
+					line = stripCR(line, stripCRLF)
+					h := hash48b(line)
+					if !idx.Contains(h) {
+						*out = append(*out, line...) // Append to output buffer
+						*out = append(*out, '\n')
+						if len(*out) >= flushSz {
+							if err := flush(); err != nil {
+								return n, err
 							}
 						}
 					}
-					start = i + 1
 				}
-			}
-			// Preserve any trailing partial line as carry (no allocation).
-			if start < len(data) {
-				// Reuse the same backing array: keep only the tail.
-				carry = append(carry[:0], data[start:]...)
-			} else {
-				// Fully consumed; reset carry to zero-length to reuse capacity.
-				carry = carry[:0]
-			}
-			pos += int64(n)
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil && err != io.EOF {
-			return err
-		}
-	}
-	// Handle a final unterminated line.
-	if len(carry) > 0 {
-		line := stripCR(carry, stripCRLF)
-		if len(line) != 0 {
-			h := hash48b(line)
-			if !idx.Contains(h) {
-				out = append(out, line...)
-				out = append(out, '\n')
+				start = i + 1
 			}
 		}
-	}
-	if len(out) > 0 {
-		if err := flush(); err != nil {
-			return err
+
+		// Handle leftover bytes that don't fit into a full line
+		if start < len(data) {
+			*carry = append((*carry)[:0], data[start:]...) // Reuse carry buffer
+		} else {
+			*carry = (*carry)[:0]
 		}
 	}
-	return nil
+	return n, err
 }
 
 func main() {
@@ -1046,7 +1041,7 @@ func main() {
 			defer wg.Done()
 			for rg := range jobs {
 				// f2 is *os.File, which already implements ReaderAt
-				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz); err != nil {
+				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz, nil); err != nil {
 					//				if err := scanRange(f2, filesz, rg, idx, bw, &wmu, *stripCRLF, *flushSz); err != nil {
 					wmu.Lock()
 					fmt.Fprintf(os.Stderr, "scanRange error [%d..%d): %v\n", rg.start, rg.end, err)
