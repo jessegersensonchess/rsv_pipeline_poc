@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"sync"
 
 	"github.com/zeebo/xxh3"
@@ -150,12 +151,37 @@ func (idx *Index16) Contains(h uint64) bool {
 	top := uint16(h >> 32)
 	low := uint32(h & 0xFFFFFFFF)
 
-	ti := int(top) // avoid uint16 wrap on +1
+	// Access the bin's offset range
+	ti := int(top)
 	lo, hi := idx.off[ti], idx.off[ti+1]
+
+	// If the bin is empty, return false immediately
 	if lo >= hi {
 		return false
 	}
-	return binarySearch32(idx.data[lo:hi], low)
+
+	// Perform a manual binary search for the hash in the bin range
+	left, right := lo, hi-1
+	for left <= right {
+		mid := left + (right-left)>>1 // Avoid overflow in mid calculation
+		midVal := idx.data[mid]
+
+		if midVal == low {
+			return true
+		} else if midVal < low {
+			left = mid + 1
+		} else {
+			right = mid - 1
+		}
+	}
+
+	return false
+}
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 64<<10) // 64KB buffer
+	},
 }
 
 // buildIndex16Parallel constructs the compact index from file1 using two fully
@@ -169,326 +195,7 @@ func (idx *Index16) Contains(h uint64) bool {
 //	per-bin start offsets, bumping a worker-local cursor.
 //
 // Finally: bins are sorted in place in parallel.
-func buildIndex16Parallel(path string, stripCRLF bool, workers int, minBlk int64) (*Index16, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	// Best-effort kernel hints for large sequential scans.
-	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
-	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_WILLNEED)
-
-	// Split file1 into W newline-aligned ranges.
-	ranges, err := splitRanges(f, workers, minBlk)
-	if err != nil {
-		return nil, err
-	}
-
-	// ----- Pass 1: local counts per worker -----
-	type wcounts = [1 << 16]int
-	locals := make([]*wcounts, len(ranges))
-
-	var wg sync.WaitGroup
-	wg.Add(len(ranges))
-	for wi, rg := range ranges {
-		wi, rg := wi, rg
-		go func() {
-			defer wg.Done()
-			const bufSz = 1 << 20
-			rbuf := make([]byte, bufSz)
-			var carry []byte
-			c := new(wcounts)
-
-			// Align range boundaries like scanRange does.
-			// Start alignment
-			if rg.start != 0 {
-				tmp := make([]byte, 64<<10)
-				pos := rg.start
-				for {
-					n, err := f.ReadAt(tmp, pos)
-					if n == 0 {
-						break
-					}
-					if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
-						rg.start = pos + int64(i+1)
-						break
-					}
-					pos += int64(n)
-					if err == io.EOF {
-						return
-					}
-				}
-			}
-			// End alignment
-			if st, e := f.Stat(); e == nil {
-				filesz := st.Size()
-				if rg.end < filesz {
-					tmp := make([]byte, 64<<10)
-					pos := rg.end
-					for {
-						n, err := f.ReadAt(tmp, pos)
-						if n == 0 {
-							break
-						}
-						if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
-							rg.end = pos + int64(j+1)
-							break
-						}
-						pos += int64(n)
-						if err == io.EOF {
-							rg.end = filesz
-							break
-						}
-					}
-				}
-			}
-
-			// Scan range and count bins.
-			for pos := rg.start; pos < rg.end; {
-				toRead := bufSz
-				if rem := int(rg.end - pos); rem < toRead {
-					toRead = rem
-				}
-				n, err := f.ReadAt(rbuf[:toRead], pos)
-				if n > 0 {
-					data := rbuf[:n]
-					if len(carry) > 0 {
-						carry = append(carry, data...)
-						data = carry
-					}
-					start := 0
-					for i, ch := range data {
-						if ch == '\n' {
-							line := data[start:i]
-							if len(line) != 0 {
-								if stripCRLF && line[len(line)-1] == '\r' {
-									line = line[:len(line)-1]
-								}
-								h := hash48b(line)
-								(*c)[uint16(h>>32)]++
-							}
-							start = i + 1
-						}
-					}
-					if start < len(data) {
-						carry = append(carry[:0], data[start:]...)
-					} else {
-						carry = carry[:0]
-					}
-					pos += int64(n)
-				}
-				if err == io.EOF {
-					break
-				}
-				if err != nil && err != io.EOF {
-					return
-				}
-			}
-			// Final unterminated line
-			if len(carry) > 0 {
-				line := carry
-				if stripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
-					line = line[:len(line)-1]
-				}
-				if len(line) != 0 {
-					h := hash48b(line)
-					(*c)[uint16(h>>32)]++
-				}
-			}
-			locals[wi] = c
-		}()
-	}
-	wg.Wait()
-
-	// Reduce local counts -> global counts and compute global offsets.
-	counts := make([]int, 1<<16)
-	for bin := 0; bin < (1 << 16); bin++ {
-		sum := 0
-		for _, lc := range locals {
-			if lc != nil {
-				sum += (*lc)[bin]
-			}
-		}
-		counts[bin] = sum
-	}
-	off := make([]int, (1<<16)+1)
-	total := 0
-	for i := 0; i < (1 << 16); i++ {
-		off[i] = total
-		total += counts[i]
-	}
-	off[1<<16] = total
-
-	// Compute per-worker starts for each bin: start[w][bin] = off[bin] + prefix_w(counts[w'][bin])
-	starts := make([][]int, len(ranges))
-	for w := range starts {
-		starts[w] = make([]int, 1<<16)
-	}
-	for bin := 0; bin < (1 << 16); bin++ {
-		base := off[bin]
-		p := base
-		for w, lc := range locals {
-			starts[w][bin] = p
-			if lc != nil {
-				p += (*lc)[bin]
-			}
-		}
-	}
-
-	// Allocate the flat data slice and make worker-local cursors (copy of starts).
-	data := make([]uint32, total)
-	cursors := make([][]int, len(ranges))
-	for w := range cursors {
-		cpy := make([]int, 1<<16)
-		copy(cpy, starts[w])
-		cursors[w] = cpy
-	}
-
-	// ----- Pass 2: each worker fills its assigned slots, no atomics -----
-	wg.Add(len(ranges))
-	for wi, rg := range ranges {
-		wi, rg := wi, rg
-		go func() {
-			defer wg.Done()
-			const bufSz = 1 << 20
-			rbuf := make([]byte, bufSz)
-			var carry []byte
-			cur := cursors[wi]
-
-			// Re-align range as in Pass 1 (cheap; kept for clarity/correctness).
-			if rg.start != 0 {
-				tmp := make([]byte, 64<<10)
-				pos := rg.start
-				for {
-					n, err := f.ReadAt(tmp, pos)
-					if n == 0 {
-						if err != nil {
-							return
-						}
-						break
-					}
-					if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
-						rg.start = pos + int64(i+1)
-						break
-					}
-					pos += int64(n)
-					if err == io.EOF {
-						return
-					}
-				}
-			}
-			if st, e := f.Stat(); e == nil {
-				filesz := st.Size()
-				if rg.end < filesz {
-					tmp := make([]byte, 64<<10)
-					pos := rg.end
-					for {
-						n, err := f.ReadAt(tmp, pos)
-						if n == 0 {
-							break
-						}
-						if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
-							rg.end = pos + int64(j+1)
-							break
-						}
-						pos += int64(n)
-						if err == io.EOF {
-							rg.end = filesz
-							break
-						}
-					}
-				}
-			}
-
-			for pos := rg.start; pos < rg.end; {
-				toRead := bufSz
-				if rem := int(rg.end - pos); rem < toRead {
-					toRead = rem
-				}
-				n, err := f.ReadAt(rbuf[:toRead], pos)
-				if n > 0 {
-					dataB := rbuf[:n]
-					if len(carry) > 0 {
-						carry = append(carry, dataB...)
-						dataB = carry
-					}
-					start := 0
-					for i, ch := range dataB {
-						if ch == '\n' {
-							line := dataB[start:i]
-							if len(line) != 0 {
-								if stripCRLF && line[len(line)-1] == '\r' {
-									line = line[:len(line)-1]
-								}
-								h := hash48b(line)
-								top := int(uint16(h >> 32))
-								pos := cur[top]
-								data[pos] = uint32(h & 0xFFFFFFFF)
-								cur[top] = pos + 1
-							}
-							start = i + 1
-						}
-					}
-					if start < len(dataB) {
-						carry = append(carry[:0], dataB[start:]...)
-					} else {
-						carry = carry[:0]
-					}
-					pos += int64(n)
-				}
-				if err == io.EOF {
-					break
-				}
-				if err != nil && err != io.EOF {
-					return
-				}
-			}
-			if len(carry) > 0 {
-				line := carry
-				if stripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
-					line = line[:len(line)-1]
-				}
-				if len(line) != 0 {
-					h := hash48b(line)
-					top := int(uint16(h >> 32))
-					p := cur[top]
-					data[p] = uint32(h & 0xFFFFFFFF)
-					cur[top] = p + 1
-				}
-			}
-		}()
-	}
-	wg.Wait()
-
-	// ----- Parallel in-place sort per bin -----
-	type task struct{ lo, hi int }
-	tasks := make(chan task, 256)
-	sortWorkers := runtime.GOMAXPROCS(0)
-	if sortWorkers < 1 {
-		sortWorkers = 1
-	}
-	wg.Add(sortWorkers)
-	for w := 0; w < sortWorkers; w++ {
-		go func() {
-			defer wg.Done()
-			for t := range tasks {
-				slices.Sort(data[t.lo:t.hi])
-			}
-		}()
-	}
-	for i := 0; i < (1 << 16); i++ {
-		lo, hi := off[i], off[i+1]
-		if hi-lo > 1 {
-			tasks <- task{lo: lo, hi: hi}
-		}
-	}
-	close(tasks)
-	wg.Wait()
-
-	return &Index16{off: off, data: data}, nil
-}
+// MOVED func buildIndex16Parallel moved
 
 // buildIndex16 constructs the compact index from file1 using two streaming passes.
 // Pass 1 counts items per top16 bin; Pass 2 fills a single flat array; finally,
@@ -932,6 +639,328 @@ func readAndProcessLines(
 		}
 	}
 	return n, err
+}
+
+// Define Range struct to represent the start and end positions in the file
+type Range struct {
+	start int64
+	end   int64
+}
+
+// buildIndex16Parallel constructs the compact index from file1 using two fully
+// parallel streaming passes over newline-aligned byte ranges. It avoids atomics
+// by assigning each worker disjoint subranges within every bin.
+
+// Corrected version of `alignRange` function to use `fileRange`
+func alignRange(f *os.File, rg *fileRange, stripCRLF bool) error {
+	// Start alignment
+	if rg.start != 0 {
+		tmp := bufPool.Get().([]byte)
+		defer bufPool.Put(tmp)
+		pos := rg.start
+		for {
+			n, err := f.ReadAt(tmp, pos)
+			if n == 0 {
+				break
+			}
+			if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
+				rg.start = pos + int64(i+1)
+				break
+			}
+			pos += int64(n)
+			if err == io.EOF {
+				return nil
+			}
+		}
+	}
+	// End alignment
+	if st, e := f.Stat(); e == nil {
+		filesz := st.Size()
+		if rg.end < filesz {
+			tmp := bufPool.Get().([]byte)
+			defer bufPool.Put(tmp)
+			pos := rg.end
+			for {
+				n, err := f.ReadAt(tmp, pos)
+				if n == 0 {
+					break
+				}
+				if j := bytes.IndexByte(tmp[:n], '\n'); j >= 0 {
+					rg.end = pos + int64(j+1)
+					break
+				}
+				pos += int64(n)
+				if err == io.EOF {
+					rg.end = filesz
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Adjust the buildIndex16Parallel function to use `fileRange`
+
+func buildIndex16Parallel(path string, stripCRLF bool, workers int, minBlk int64) (*Index16, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Best-effort kernel hints for large sequential scans.
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_WILLNEED)
+
+	// Split file1 into W newline-aligned ranges.
+	ranges, err := splitRanges(f, workers, minBlk)
+	if err != nil {
+		return nil, err
+	}
+
+	// ----- Pass 1: local counts per worker -----
+	type wcounts = [1 << 16]int
+	locals := make([]*wcounts, len(ranges))
+
+	var wg sync.WaitGroup
+	wg.Add(len(ranges))
+
+	// Memory pool to avoid allocations for each worker
+	for wi, rg := range ranges {
+		wi, rg := wi, rg
+		go func() {
+			defer wg.Done()
+			// const bufSz = 1 << 20
+			const bufSz = 1 << 18
+			rbuf := make([]byte, bufSz)
+			var carry []byte
+			c := new(wcounts)
+
+			// Read the aligned start and end positions for the range
+			if err := alignRange(f, &rg, stripCRLF); err != nil {
+				return
+			}
+
+			// Scan range and count bins
+			for pos := rg.start; pos < rg.end; {
+				toRead := int(rg.end - pos)
+				if toRead > len(rbuf) {
+					toRead = len(rbuf)
+				}
+				n, err := f.ReadAt(rbuf[:toRead], pos)
+				if err != nil && err != io.EOF {
+					return
+				}
+				if n == 0 {
+					break
+				}
+
+				data := rbuf[:n]
+				if len(carry) > 0 {
+					carry = append(carry, data...)
+					data = carry
+				}
+
+				// Process the data in chunks, counting bins
+				start := 0
+				for i, ch := range data {
+					if ch == '\n' {
+						line := data[start:i]
+						if len(line) != 0 {
+							if stripCRLF && line[len(line)-1] == '\r' {
+								line = line[:len(line)-1]
+							}
+							h := hash48b(line)
+							(*c)[uint16(h>>32)]++
+						}
+						start = i + 1
+					}
+				}
+
+				if start < len(data) {
+					carry = append(carry[:0], data[start:]...)
+				} else {
+					carry = carry[:0]
+				}
+				pos += int64(n)
+			}
+
+			// Final unterminated line
+			if len(carry) > 0 {
+				line := carry
+				if stripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
+				if len(line) != 0 {
+					h := hash48b(line)
+					(*c)[uint16(h>>32)]++
+				}
+			}
+
+			// Save the local counts for this worker
+			locals[wi] = c
+		}()
+	}
+	wg.Wait()
+
+	// Reduce local counts -> global counts and compute global offsets
+	counts := make([]int, 1<<16)
+	for bin := 0; bin < (1 << 16); bin++ {
+		sum := 0
+		for _, lc := range locals {
+			if lc != nil {
+				sum += (*lc)[bin]
+			}
+		}
+		counts[bin] = sum
+	}
+
+	off := make([]int, (1<<16)+1)
+	total := 0
+	for i := 0; i < (1 << 16); i++ {
+		off[i] = total
+		total += counts[i]
+	}
+	off[1<<16] = total
+
+	// Compute per-worker starts for each bin: start[w][bin] = off[bin] + prefix_w(counts[w'][bin])
+	starts := make([][]int, len(ranges))
+	for w := range starts {
+		starts[w] = make([]int, 1<<16)
+	}
+	for bin := 0; bin < (1 << 16); bin++ {
+		base := off[bin]
+		p := base
+		for w, lc := range locals {
+			starts[w][bin] = p
+			if lc != nil {
+				p += (*lc)[bin]
+			}
+		}
+	}
+
+	// Allocate the flat data slice and make worker-local cursors (copy of starts)
+	data := make([]uint32, total)
+	cursors := make([][]int, len(ranges))
+	for w := range cursors {
+		cpy := make([]int, 1<<16)
+		copy(cpy, starts[w])
+		cursors[w] = cpy
+	}
+
+	// ----- Pass 2: each worker fills its assigned slots, no atomics -----
+	wg.Add(len(ranges))
+	for wi, rg := range ranges {
+		wi, rg := wi, rg
+		go func() {
+			defer wg.Done()
+
+			// Reuse buffer from the pool for reading
+			rbuf := bufPool.Get().([]byte)
+			defer bufPool.Put(rbuf)
+
+			var carry []byte
+			cur := cursors[wi]
+
+			// Re-align range as in Pass 1 (cheap; kept for clarity/correctness)
+			if err := alignRange(f, &rg, stripCRLF); err != nil {
+				return
+			}
+
+			// Scan range and fill the assigned slots in the data slice
+			for pos := rg.start; pos < rg.end; {
+				toRead := int(rg.end - pos)
+				if toRead > len(rbuf) {
+					toRead = len(rbuf)
+				}
+				n, err := f.ReadAt(rbuf[:toRead], pos)
+				if err != nil && err != io.EOF {
+					return
+				}
+				if n == 0 {
+					break
+				}
+
+				dataB := rbuf[:n]
+				if len(carry) > 0 {
+					carry = append(carry, dataB...)
+					dataB = carry
+				}
+
+				// Process the data and fill in the bins for each worker
+				start := 0
+				for i, ch := range dataB {
+					if ch == '\n' {
+						line := dataB[start:i]
+						if len(line) != 0 {
+							if stripCRLF && line[len(line)-1] == '\r' {
+								line = line[:len(line)-1]
+							}
+							h := hash48b(line)
+							top := int(uint16(h >> 32))
+							pos := cur[top]
+							data[pos] = uint32(h & 0xFFFFFFFF)
+							cur[top] = pos + 1
+						}
+						start = i + 1
+					}
+				}
+
+				if start < len(dataB) {
+					carry = append(carry[:0], dataB[start:]...)
+				} else {
+					carry = carry[:0]
+				}
+				pos += int64(n)
+			}
+
+			// Final unterminated line
+			if len(carry) > 0 {
+				line := carry
+				if stripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
+				if len(line) != 0 {
+					h := hash48b(line)
+					top := int(uint16(h >> 32))
+					p := cur[top]
+					data[p] = uint32(h & 0xFFFFFFFF)
+					cur[top] = p + 1
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// ----- Parallel in-place sort per bin -----
+	type task struct{ lo, hi int }
+	tasks := make(chan task, 256)
+	sortWorkers := runtime.GOMAXPROCS(0)
+	if sortWorkers < 1 {
+		sortWorkers = 1
+	}
+	wg.Add(sortWorkers)
+	for w := 0; w < sortWorkers; w++ {
+		go func() {
+			defer wg.Done()
+			for t := range tasks {
+				sort.Slice(data[t.lo:t.hi], func(i, j int) bool {
+					return data[t.lo+i] < data[t.lo+j]
+				})
+			}
+		}()
+	}
+	for i := 0; i < (1 << 16); i++ {
+		lo, hi := off[i], off[i+1]
+		if hi-lo > 1 {
+			tasks <- task{lo: lo, hi: hi}
+		}
+	}
+	close(tasks)
+	wg.Wait()
+
+	return &Index16{off: off, data: data}, nil
 }
 
 func main() {
