@@ -260,6 +260,46 @@ func (p *smallPg) CopyTechInspections(ctx context.Context, rows [][]interface{})
 	return nil
 }
 
+// CreateRSVZpravyTable ensures the "rsv_zpravy_vyrobce_zastupce" table exists.
+func (p *smallPg) CreateRSVZpravyTable(ctx context.Context) error {
+	ddl := `
+	CREATE TABLE IF NOT EXISTS rsv_zpravy_vyrobce_zastupce (
+		pcv INT,
+		kratky_text TEXT
+	);
+	CREATE INDEX IF NOT EXISTS rsv_zpravy_vyrobce_zastupce_pcv_idx ON rsv_zpravy_vyrobce_zastupce(pcv);`
+	_, err := p.conn.Exec(ctx, ddl)
+	return err
+}
+
+// CopyRSVZpravy performs a bulk COPY INTO the "rsv_zpravy_vyrobce_zastupce" table.
+func (p *smallPg) CopyRSVZpravy(ctx context.Context, rows [][]interface{}) error {
+	tx, err := p.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	n, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"rsv_zpravy_vyrobce_zastupce"},
+		[]string{"pcv", "kratky_text"},
+		pgx.CopyFromRows(rows),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres CopyFrom rsv_zpravy_vyrobce_zastupce: %w", err)
+	}
+
+	if n != int64(len(rows)) {
+		log.Printf("⚠️  postgres CopyFrom(rsv_zpravy_vyrobce_zastupce): inserted %d of %d rows — some were rejected", n, len(rows))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres commit rsv_zpravy_vyrobce_zastupce: %w", err)
+	}
+	return nil
+}
+
 // Close closes the underlying pgx.Conn.
 func (p *smallPg) Close(ctx context.Context) error { return p.conn.Close(ctx) }
 

@@ -83,6 +83,7 @@ func (f *fakeSmallDB) CopyOwnership(_ context.Context, records [][]interface{}) 
 	f.batches = append(f.batches, b)
 	return nil
 }
+
 func (f *fakeSmallDB) Close(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -97,6 +98,13 @@ func (f *fakeSmallDB) CopyTechInspections(ctx context.Context, rows [][]interfac
 }
 
 func (f *fakeSmallDB) CreateTechInspectionsTable(ctx context.Context) error { return nil }
+
+func (f *fakeSmallDB) CopyRSVZpravy(ctx context.Context, rows [][]interface{}) error { return nil }
+
+// CreateRSVZpravyTable is part of db.SmallDB; this fake just satisfies the interface.
+func (f *fakeSmallDB) CreateRSVZpravyTable(ctx context.Context) error {
+	return nil
+}
 
 func fakeFactory(f *fakeSmallDB) db.SmallDBFactory {
 	return func(ctx context.Context) (db.SmallDB, error) { return f, nil }

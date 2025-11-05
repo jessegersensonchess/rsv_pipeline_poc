@@ -319,6 +319,52 @@ func (m *smallMSSQL) CopyTechInspections(ctx context.Context, records [][]interf
 	return tx.Commit()
 }
 
+// CreateRSVZpravyTable ensures the "rsv_zpravy_vyrobce_zastupce" table exists.
+func (m *smallMSSQL) CreateRSVZpravyTable(ctx context.Context) error {
+	ddl := `
+	IF OBJECT_ID(N'rsv_zpravy_vyrobce_zastupce', N'U') IS NULL
+	BEGIN
+	  CREATE TABLE rsv_zpravy_vyrobce_zastupce (
+	    pcv INT,
+	    kratky_text NVARCHAR(MAX)
+	  );
+	END
+	IF NOT EXISTS (
+	  SELECT 1
+	  FROM sys.indexes
+	  WHERE name = 'rsv_zpravy_vyrobce_zastupce_pcv_idx'
+	    AND object_id = OBJECT_ID(N'rsv_zpravy_vyrobce_zastupce')
+	)
+	CREATE INDEX rsv_zpravy_vyrobce_zastupce_pcv_idx ON rsv_zpravy_vyrobce_zastupce(pcv);`
+	_, err := m.db.ExecContext(ctx, ddl)
+	return err
+}
+
+// CopyRSVZpravy inserts rows into the rsv_zpravy_vyrobce_zastupce table.
+func (m *smallMSSQL) CopyRSVZpravy(ctx context.Context, records [][]interface{}) error {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO rsv_zpravy_vyrobce_zastupce (pcv, kratky_text)
+		VALUES (@p1, @p2)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, r := range records {
+		if _, err := stmt.ExecContext(ctx, r...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // Close closes the underlying connection.
 func (m *smallMSSQL) Close(ctx context.Context) error { return m.db.Close() }
 

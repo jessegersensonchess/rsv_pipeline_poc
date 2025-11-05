@@ -29,7 +29,8 @@ type Config struct {
 	// IO controls input/diagnostic file locations.
 	OwnershipCSV       string // Path to ownership CSV data.
 	VehicleCSV         string // Path to vehicle technology CSV data.
-	TechInspectionsCSV string `env:"TECH_CSV"` // path to technicky_prohlidky CSV
+	TechInspectionsCSV string `env:"TECH_CSV"`   // path to technicky_prohlidky CSV
+	ZpravyCSV          string `env:"ZPRAVY_CSV"` // path to Zprávy výrobce/akreditovaného zástupce CSV
 	SkippedDir         string // Directory for writing skipped-row CSV logs.
 
 	// DB describes the target database. For MSSQL a full DSN is required.
@@ -94,6 +95,7 @@ func LoadFromArgs(fs *flag.FlagSet, getenv func(string) string, args []string) *
 	fs.StringVar(&cfg.OwnershipCSV, "ownership_csv", envOrDefaultFn("OWNERSHIP_CSV", "RSV_vlastnik_provozovatel_vozidla_20250901.csv"), "Path to ownership CSV")
 	fs.StringVar(&cfg.VehicleCSV, "vehicle_csv", envOrDefaultFn("VEHICLE_CSV", "RSV_vypis_vozidel_20250902.csv"), "Path to vehicle tech CSV")
 	fs.StringVar(&cfg.TechInspectionsCSV, "tech_csv", envOrDefaultFn("TECH_CSV", "RSV_technicke_prohlidky_20250902.csv"), "Path to technical inspections CSV")
+	fs.StringVar(&cfg.ZpravyCSV, "zpravy_csv", envOrDefaultFn("ZPRAVY_CSV", "RSV_zpravy_vyrobce_zastupce.csv"), "Path to Zprávy výrobce/akreditovaného zástupce CSV")
 	fs.StringVar(&cfg.SkippedDir, "skipped_dir", envOrDefaultFn("SKIPPED_DIR", "./skipped"), "Directory for writing skipped-rows CSV logs.")
 
 	// DB connectivity

@@ -25,6 +25,10 @@ type SmallDB interface {
 	// tech inspections
 	CreateTechInspectionsTable(ctx context.Context) error
 	CopyTechInspections(ctx context.Context, rows [][]interface{}) error
+
+	// RSV zpravy importer
+	CreateRSVZpravyTable(ctx context.Context) error
+	CopyRSVZpravy(ctx context.Context, rows [][]interface{}) error
 }
 
 // DBFactory can mint a new DB connection per worker (for parallel ingestion).

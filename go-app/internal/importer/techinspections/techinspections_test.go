@@ -53,12 +53,22 @@ func (f *fakeSmallDB) CopyTechInspections(ctx context.Context, rows [][]interfac
 // CopyOwnership is part of db.SmallDB in your codebase; provide a no-op to satisfy the interface.
 func (f *fakeSmallDB) CopyOwnership(ctx context.Context, rows [][]interface{}) error { return nil }
 
-// Close is a no-op for the fake.
-func (f *fakeSmallDB) Close(ctx context.Context) error { return nil }
-
 // If your db.SmallDB also includes CreateOwnershipTable (many versions do), include a stub.
 // This is harmless even if the interface doesn’t require it.
 func (f *fakeSmallDB) CreateOwnershipTable(ctx context.Context) error { return nil }
+
+// CreateRSVZpravyTable is part of db.SmallDB; this fake just satisfies the interface.
+func (f *fakeSmallDB) CreateRSVZpravyTable(ctx context.Context) error {
+	return nil
+}
+
+// CopyRSVZpravy is part of db.SmallDB; this fake just satisfies the interface.
+func (f *fakeSmallDB) CopyRSVZpravy(ctx context.Context, rows [][]interface{}) error {
+	return nil
+}
+
+// Close is a no-op for the fake.
+func (f *fakeSmallDB) Close(ctx context.Context) error { return nil }
 
 // makeFactory builds a db.SmallDBFactory that returns distinct fakeSmallDB instances
 // all pointing at the same recorder.

@@ -135,3 +135,17 @@ Run go fmt / go vet before submitting a PR.
     go fmt ./...
     go vet ./...
 ```
+
+# TODO
+
+edit instructions for adding new importer:  
+1. add importer in internal/importer/  
+2. add db methods in internal/db/{db.go, postgres.go, mssql.go}  
+3. update fakeSmallDB in internal/importer/[subdir]/[file]_test.go files  
+4. add to internal/config/config.go  
+5. add importer to cmd/importer/main.go
+6. confirm tests are green  
+7. add importer to docker-compose.yml and confirm it runs 
+```docker compose --profile postgres up --build go-app-postgres```
+
+add a '-type' flag, so importer can do one import at a time  
