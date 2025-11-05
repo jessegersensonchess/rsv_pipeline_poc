@@ -19,12 +19,32 @@ It is designed for **speed, streaming, and low memory usage**:
 ```sh
 linediff -file1 old.csv -file2 new.csv > diff.csv
 
+~$ cat file1
+fieldA, fieldB, fieldC
+1, 1, 1
+2, 2, 2
+3, 3, 3
+
+~$ cat file2
+fieldA, fieldB, fieldC
+2, 2, 2
+1, 1, 1
+4, 4, 4
+3, 3, 3
+
+~$ linediff -file1 file1 -file2 file2
+fieldA, fieldB, fieldC
+4, 4, 4
+
 linediff -flush=262144 -workers 4 -block=262144 -file1 RSV_vypis_vozidel_20250902.csv -file2 RSV_vypis_vozidel_20251002.csv
+```
 
 ## Build
-build a windows exe with:
+go build -o cmd/linediff/main.go
+#### windows exe
 GOOS=windows GOARCH=amd64 go build -o linediff.exe cmd/linediff/main.go
   
 docker compose build linediff  
 docker compose run --rm linediff -file1 vypis-a.csv -file2 vypis-b.csv
+
 

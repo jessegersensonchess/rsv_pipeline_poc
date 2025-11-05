@@ -32,20 +32,21 @@ import (
 
 const (
 	// Reader buffer used while indexing file1.
-	readBufSize = 4 << 20 // 4 MiB
+	// readBufSize = 4 << 20 // 4 MiB
+	readBufSize = 1 << 20
 
 	// Buffered writer for stdout to amortize syscalls.
-	writeBufSize = 4 << 20 // 4 MiB
+	writeBufSize = 1 << 20
 
 	// Minimum byte range per worker when splitting file2.
 	// Small ranges improve cache behavior on modest L3 caches.
-	defaultBlkSz = 2 << 20 // 2 MiB
-
-	defaultBufSz = 1 << 18 // 256KiB per worker
-	defaultTmpSz = 64 << 9 // 32 KiB for temporary buffer
+	defaultBufSz = 1 << 18 // per worker
+	// defaultTmpSz = 64 << 9 // 32 KiB for temporary buffer
+	defaultTmpSz = 64 << 10 // for temporary buffer
+	defaultBlkSz = 1 << 18  // for temporary buffer
 
 	// Default per-worker buffered output flush threshold (overridable via -flush).
-	defaultOutputFlushSz = 2 << 20 // 2 MiB
+	defaultOutputFlushSz = 1 << 18 // 262144
 
 	// We keep 48 bits (6 bytes) of xxhash for the set index.
 	hashMask48 = 0xFFFFFFFFFFFF
@@ -460,7 +461,102 @@ func alignEnd(r ReaderAt, tmpSz int, filesz int64, end *int64) error {
 	return nil
 }
 
-// --- NEW: scanRange using per-worker context ---
+func XXXscanRange(
+	r ReaderAt,
+	filesz int64,
+	rg fileRange,
+	idx *Index16,
+	wc *WorkerCtx,
+	opts Opts,
+) ([]byte, error) {
+	opts = opts.withDefaults()
+
+	// Align boundaries to newlines
+	if err := alignStart(r, opts.TmpSz, &rg.start); err != nil && err != io.EOF {
+		return nil, err
+	}
+	if err := alignEnd(r, opts.TmpSz, filesz, &rg.end); err != nil && err != io.EOF {
+		return nil, err
+	}
+	if rg.start >= rg.end {
+		return nil, nil
+	}
+
+	// Preallocate space for out slice
+	var out []byte
+	buf := wc.Buf
+	wc.Carry = wc.Carry[:0]
+	pos := rg.start
+
+	for pos < rg.end {
+		toRead := len(buf)
+		if rem := int(rg.end - pos); rem < toRead {
+			toRead = rem
+		}
+		n, err := r.ReadAt(buf[:toRead], pos)
+		if n > 0 {
+			data := buf[:n]
+			if len(wc.Carry) > 0 {
+				// Combine carry with current buffer data
+				data = append(wc.Carry, data...)
+				wc.Carry = wc.Carry[:0]
+			}
+
+			start := 0
+			for i, c := range data {
+				if c == '\n' {
+					line := data[start:i]
+					start = i + 1
+					if len(line) > 0 {
+						if opts.StripCRLF && line[len(line)-1] == '\r' {
+							line = line[:len(line)-1]
+						}
+						if len(line) > 0 && !idx.Contains(hash48b(line)) {
+							// Allocate space for line + newline
+							out = append(out, line...)
+							out = append(out, '\n')
+						}
+					}
+				}
+			}
+			if start < len(data) {
+				// Store remainder for next iteration
+				wc.Carry = append(wc.Carry[:0], data[start:]...)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		pos += int64(n)
+	}
+
+	// Process final carry (unfinished line)
+	if len(wc.Carry) > 0 {
+		line := wc.Carry
+		if opts.StripCRLF && len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) > 0 && !idx.Contains(hash48b(line)) {
+			out = append(out, line...)
+			out = append(out, '\n')
+		}
+	}
+
+	// Return result
+	if len(out) == 0 {
+		return nil, nil
+	}
+	result := make([]byte, len(out))
+	copy(result, out)
+	// Reset wc.Out for reuse
+	wc.Out = wc.Out[:0]
+	return result, nil
+}
+
+// scanRange using per-worker context
 // Returns a slice containing the lines from rg that are NOT in idx.
 // The returned slice is safe for the caller to keep; the worker reuses its own buffers.
 
@@ -565,141 +661,6 @@ func scanRange(
 	return result, nil
 }
 
-func XXXscanRange(
-	r ReaderAt,
-	filesz int64,
-	rg fileRange,
-	idx *Index16,
-	wr io.Writer,
-	wmu *sync.Mutex,
-	stripCRLF bool,
-	flushSz int,
-	opts *scanOpts,
-) error {
-	// Get scanOpts or use default
-	options := NewScanOpts(opts)
-	bufSz, tmpSz := options.BufSz, options.TmpSz
-
-	buf := make([]byte, bufSz)
-	out := make([]byte, 0, flushSz) // Reuse the output buffer for reduced allocations
-	var carry []byte                // Reuse carry buffer to accumulate leftover bytes between reads
-
-	// Helper function to flush output buffer to writer
-	flush := func() error {
-		if len(out) == 0 {
-			return nil
-		}
-		wmu.Lock()
-		_, err := wr.Write(out) // Flush the buffer when it's full or at EOF
-		wmu.Unlock()
-		out = out[:0] // Clear the output slice to prevent unnecessary memory usage
-		return err
-	}
-
-	// Align to newline at the start (reused logic from previous version)
-	if err := alignStart(r, tmpSz, &rg.start); err != nil {
-		return err
-	}
-
-	// Extend the end to the next newline
-	if err := alignEnd(r, tmpSz, filesz, &rg.end); err != nil {
-		return err
-	}
-
-	// Scan the range and process lines
-	pos := rg.start
-	for pos < rg.end {
-		n, err := readAndProcessLines(r, buf, &carry, pos, rg.end, idx, stripCRLF, &out, flushSz, flush)
-		if err == io.EOF {
-			// Expected when the reader reaches the end of file
-			break
-		} else if err != nil {
-			return err
-		}
-		pos += int64(n)
-	}
-
-	// Final flush of remaining carryover bytes
-	if len(carry) > 0 {
-		line := stripCR(carry, stripCRLF)
-		if len(line) != 0 {
-			h := hash48b(line)
-			if !idx.Contains(h) {
-				out = append(out, line...)
-				out = append(out, '\n')
-			}
-		}
-	}
-
-	return flush()
-}
-
-func readAndProcessLines(
-	r ReaderAt,
-	buf []byte,
-	carry *[]byte,
-	pos, end int64,
-	idx *Index16,
-	stripCRLF bool,
-	out *[]byte,
-	flushSz int,
-	flush func() error,
-) (int, error) {
-	toRead := len(buf)
-	if rem := int(end - pos); rem < toRead {
-		toRead = rem
-	}
-
-	n, err := r.ReadAt(buf[:toRead], pos)
-	if n > 0 {
-		data := buf[:n]
-		if len(*carry) > 0 {
-			*carry = append(*carry, data...)
-			data = *carry
-		}
-
-		// Process each line
-		start := 0
-		for i, c := range data {
-			if c == '\n' {
-				line := data[start:i]
-				if len(line) != 0 {
-					line = stripCR(line, stripCRLF)
-					h := hash48b(line)
-					if !idx.Contains(h) {
-						*out = append(*out, line...) // Append to output buffer
-						*out = append(*out, '\n')
-						if len(*out) >= flushSz {
-							if err := flush(); err != nil {
-								return n, err
-							}
-						}
-					}
-				}
-				start = i + 1
-			}
-		}
-
-		// Handle leftover bytes that don't fit into a full line
-		if start < len(data) {
-			*carry = append((*carry)[:0], data[start:]...) // Reuse carry buffer
-		} else {
-			*carry = (*carry)[:0]
-		}
-	}
-	return n, err
-}
-
-// Define Range struct to represent the start and end positions in the file
-type Range struct {
-	start int64
-	end   int64
-}
-
-// buildIndex16Parallel constructs the compact index from file1 using two fully
-// parallel streaming passes over newline-aligned byte ranges. It avoids atomics
-// by assigning each worker disjoint subranges within every bin.
-
 // Corrected version of `alignRange` function to use `fileRange`
 func alignRange(f *os.File, rg *fileRange, stripCRLF bool) error {
 	// Start alignment
@@ -748,8 +709,6 @@ func alignRange(f *os.File, rg *fileRange, stripCRLF bool) error {
 	}
 	return nil
 }
-
-// Adjust the buildIndex16Parallel function to use `fileRange`
 
 func buildIndex16Parallel(path string, stripCRLF bool, workers int, minBlk int64) (*Index16, error) {
 	f, err := os.Open(path)
@@ -1012,8 +971,7 @@ func buildIndex16Parallel(path string, stripCRLF bool, workers int, minBlk int64
 	return &Index16{off: off, data: data}, nil
 }
 
-// --- NEW: options and per-worker scratch ---
-
+// options and per-worker scratch
 type Opts struct {
 	StripCRLF bool
 	FlushSz   int // per-chunk flush threshold for workers (not shared writer buf)
@@ -1181,9 +1139,9 @@ func main() {
 	//   -flush: per-worker flush size in bytes (caps worker buffer growth).
 	file1 := flag.String("file1", "", "Path to the first file")
 	file2 := flag.String("file2", "", "Path to the second file")
-	workers := flag.Int("workers", runtime.NumCPU(), "Number of worker goroutines for file2 processing")
+	workers := flag.Int("workers", runtime.NumCPU()/2, "Number of worker goroutines for file2 processing")
 	blockSize := flag.Int("block", defaultBlkSz, "Minimum byte range per worker (also used for alignment scanning)")
-	hashAlg := flag.String("hash", "xxh3", `Hash algorithm: "xxh3" (default)`)
+	// hashAlg := flag.String("hash", "xxh3", `Hash algorithm: "xxh3" (default)`)
 	stripCRLF := flag.Bool("strip_crlf", true, "Strip trailing '\\r' from lines (for CRLF). Disable for LF-only data.")
 	flushSz := flag.Int("flush", defaultOutputFlushSz, "Per-worker buffered output flush threshold in bytes")
 	flag.Parse()
@@ -1195,14 +1153,14 @@ func main() {
 	}
 
 	// Select hash implementation.
-	switch *hashAlg {
-	case "xxh3":
-		hashFn = func(b []byte) uint64 { return xxh3.Hash(b) }
-	default:
-		fmt.Fprintf(os.Stderr, "unknown -hash=%q (use xxh3)\n", *hashAlg)
-		os.Exit(1)
-	}
+	//switch *hashAlg {
+	//case "xxh3":
+	//	hashFn = func(b []byte) uint64 { return xxh3.Hash(b) }
+	//default:
+	//	hashFn = func(b []byte) uint64 { return xxh3.Hash(b) }
+	//}
 
+	hashFn = func(b []byte) uint64 { return xxh3.Hash(b) }
 	// Reduce GC frequency during large one-shot runs, unless overridden by env.
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(800)
