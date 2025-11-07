@@ -1,0 +1,69 @@
+{
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "testdata/RSV_zpravy_vyrobce_zastupce.csv"
+    }
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "has_header": true,
+      "comma": ",",
+      "trim_space": true,
+      "expected_fields": 2,
+      "header_map": {
+        "PČV": "pcv",
+        "Krátký text": "kratky_text"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "normalize"
+    },
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "pcv": "int"
+        }
+      }
+    },
+	{
+	  "kind":"validate", 
+	  "options":{
+        "contract":"ZpravyVyrobceZastupce",
+        "date_layout":"02.01.2006",
+        "policy":"lenient",
+        "emit_rejects": true
+    }},
+    { 
+ 	  "kind": "dedupe", "options": {
+      "keys": ["pcv", "kratky_text"],
+      "policy": "most-complete",
+      "prefer_fields": ["pcv"]
+    }},
+    {
+      "kind": "require",
+      "options": {
+        "fields": ["pcv"]
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "postgres": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "table": "public.zpravy_vyrobce_zastupce",
+      "columns": [
+        "pcv",
+        "kratky_text",
+        "id"
+      ],
+      "key_columns": ["id"]
+    }
+  }
+}
+
