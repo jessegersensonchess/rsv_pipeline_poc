@@ -7,17 +7,37 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"time" // Add time import
 
 	"etl/internal/config"
+	// Register the "postgres" backend with the storage factory.
+	_ "etl/internal/storage/postgres"
 )
 
 func main() {
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "configs/pipelines/file_to_postgres.json", "pipeline config JSON path")
 	verbose := flag.Bool("v", true, "enable verbose logs") // default true as requested
+	debug := flag.Bool("d", false, "enable debug mode")
 
 	flag.Parse()
+
+	if *debug {
+		// profiling
+		f, _ := os.Create("cpu.pprof")
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+
+		hf, _ := os.Create("heap.pprof")
+		defer func() {
+			runtime.GC()
+			pprof.WriteHeapProfile(hf)
+			hf.Close()
+		}()
+		// end profiling
+	}
 
 	if !*verbose {
 		log.SetOutput(os.Stderr) // still stderr, just less chatter if you gate logs yourself
