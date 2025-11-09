@@ -16,6 +16,8 @@ import (
 	_ "etl/internal/storage/postgres"
 )
 
+// main is the entry point for the ETL binary. It loads the pipeline config,
+// sets up optional profiling, and executes the streaming pipeline run.
 func main() {
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "configs/pipelines/file_to_postgres.json", "pipeline config JSON path")
@@ -55,7 +57,7 @@ func main() {
 		fatalf("decode config: %v", err)
 	}
 
-	// Initialize the context here, before passing it to run()
+	// Initialize the context here, before passing it to runStreamed()
 	ctx := context.Background()
 	start := time.Now() // Initialize start time
 
@@ -65,9 +67,14 @@ func main() {
 			p.Source.Kind, p.Parser.Kind, p.Storage.Kind, p.Storage.Postgres.Table)
 	}
 
-	// Now call run with the correct context, spec, verbose flag, and start time
-	if err := run(ctx, p, *verbose, start); err != nil {
+	// Execute the streaming pipeline
+	if err := runStreamed(ctx, p); err != nil {
 		log.Fatalf("%v", err)
+	}
+
+	// Optional: log total elapsed time when verbose
+	if *verbose {
+		log.Printf("completed in %s", time.Since(start).Truncate(time.Millisecond))
 	}
 }
 

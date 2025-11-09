@@ -47,11 +47,18 @@ func TransformLoopRows(
 	plan := compilePlan(columns, spec)
 
 	for r := range in {
-		select {
-		case <-ctx.Done():
+		// If the context is canceled, we MUST NOT return here. Draining the
+		// input prevents upstream senders from blocking indefinitely. We can
+		// skip heavy work under cancellation but we should still Free rows.
+		if ctx.Err() != nil {
 			r.Free()
-			return
-		default:
+			continue
+		}
+
+		// Defensive: ensure the row width matches the expected columns.
+		if len(r.V) != len(columns) {
+			r.Free()
+			continue
 		}
 
 		ok := true
@@ -78,11 +85,22 @@ func TransformLoopRows(
 			continue
 		}
 
+		// Forward to downstream. If cancellation occurs and the downstream
+		// channel is congested, prefer dropping the row (with Free) rather
+		// than blocking and risking a shutdown hang.
+		if ctx.Err() != nil {
+			r.Free()
+			continue
+		}
 		select {
 		case out <- r:
-		case <-ctx.Done():
-			r.Free()
-			return
+		default:
+			// Backpressure; if canceled, drop. Otherwise, block and deliver.
+			if ctx.Err() != nil {
+				r.Free()
+				continue
+			}
+			out <- r
 		}
 	}
 }

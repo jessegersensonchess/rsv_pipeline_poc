@@ -53,9 +53,10 @@ func StreamCSV(
 	// in real data. The newStreamingRewriter is defined in csv_parser.go.
 	var r io.Reader = rc
 	if spec.Parser.Options.Bool("stream_scrub_likvidaci", false) {
+
 		r = newStreamingRewriter(r,
-			[]byte(` "v likvidaci`),
-			[]byte(` ""v likvidaci`),
+			[]byte(` "v likvidaci""`),
+			[]byte(` (v likvidaci)"`),
 		)
 	}
 

@@ -1,7 +1,9 @@
 package csv
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,5 +134,19 @@ func TestStreamCSV_Scrub(t *testing.T) {
 	}
 	if len(errs) != 0 {
 		t.Errorf("unexpected per-row errors: %v", errs)
+	}
+}
+
+func TestWrapWithLikvidaciScrub_ImplementsReadCloser(t *testing.T) {
+	f := io.NopCloser(bytes.NewBufferString(`hello`))
+	rc := wrapWithLikvidaciScrub(f, true)
+
+	if _, ok := interface{}(rc).(io.ReadCloser); !ok {
+		t.Fatalf("expected ReadCloser, got %T", rc)
+	}
+
+	// Ensure Close still works
+	if err := rc.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
 	}
 }
