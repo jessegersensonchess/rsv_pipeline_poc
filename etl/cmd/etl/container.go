@@ -147,6 +147,12 @@ type RowErr struct {
 // and emits both per-batch progress and end-of-run summary statistics.
 //
 
+// Per-batch logging is emitted on each successful flush with running totals.
+// runStreamed executes CSV → coerce → validate → storage in a fully streaming,
+// batched, concurrent fashion with pooled row reuse. It enforces fail-soft
+// semantics (bad rows are dropped before DB), aggregates parse/validate errors,
+// and emits both per-batch progress and end-of-run summary statistics.
+//
 // Stats reported:
 //   - processed:    rows that entered the coerce stage (i.e., parsed successfully)
 //   - parseErrors:  lines the CSV reader could not parse (capped detailed logs)
@@ -156,14 +162,16 @@ type RowErr struct {
 //
 // Concurrency model:
 //
-//	Reader (CSV; usually 1) → N Transformers (coerce) → Validator (required fields) → Loader (COPY in batches)
+//	Reader (CSV; usually 1)
+//	     → tap (counts "processed")
+//	     → N Transformers (coerce, in-place on pooled rows)
+//	     → Validator (required fields; fail-soft)
+//	     → Loader (COPY in batches)
 //
 // Back-pressure is provided by bounded channels; peak memory is O(batchSize +
 // channelBuffer). The loader calls COPY in batches for throughput and, on any
-// fatal DB error, cancels the context and *drains/frees* the remaining rows to
-// avoid goroutine leaks or deadlocks (no hanging on COPY errors).
-//
-// Per-batch logging is emitted on each successful flush with running totals.
+// fatal DB error, cancels the context and drains/frees remaining rows to avoid
+// goroutine leaks or deadlocks.
 func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	// Tunables (12-factor): config first, env fallback.
 	readerW := pickInt(spec.Runtime.ReaderWorkers, getenvInt("ETL_READER_WORKERS", 1))
@@ -231,8 +239,9 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	errCh := make(chan RowErr, 256)
 
 	// Pooled row channels end-to-end.
-	rawRowCh := make(chan *transformer.Row, bufSz)     // parser → coerce
-	coercedRowCh := make(chan *transformer.Row, bufSz) // coerce → validate
+	rawRowCh := make(chan *transformer.Row, bufSz)     // parser → tap
+	tapRawCh := make(chan *transformer.Row, bufSz)     // tap → transformers (counts "processed")
+	coercedRowCh := make(chan *transformer.Row, bufSz) // transformers → validate
 	validCh := make(chan *transformer.Row, bufSz)      // validate → loader
 
 	// Error/metrics collector: keep generic stage errors visible.
@@ -240,6 +249,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	wgErr.Add(1)
 	go func() {
 		defer wgErr.Done()
+		log.Printf("loader: started with batchSize=%d columns=%d", batchSz, len(spec.Storage.Postgres.Columns))
 		for e := range errCh {
 			if e.Err != nil {
 				if e.Line > 0 {
@@ -275,6 +285,26 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		}()
 	}
 
+	// --- 1.5) Tap: count "processed" and forward to transformers --------------
+	// This replaces the per-row temporary channel adapter and allows
+	// TransformLoopRows to run as a long-lived, efficient streaming loop.
+	var wgTap sync.WaitGroup
+	wgTap.Add(1)
+	go func() {
+		defer wgTap.Done()
+		defer close(tapRawCh)
+		for r := range rawRowCh {
+			c.processed.Add(1)
+			select {
+			case tapRawCh <- r:
+			case <-ctx.Done():
+				// If canceled, free the row to avoid leaks and return.
+				r.Free()
+				return
+			}
+		}
+	}()
+
 	// --- 2) Transformer pool (coerce in place on pooled rows) ---
 	var wgT sync.WaitGroup
 	wgT.Add(transW)
@@ -291,40 +321,16 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	for i := 0; i < transW; i++ {
 		go func() {
 			defer wgT.Done()
-			//			transformer.TransformLoopRows(ctx, spec.Storage.Postgres.Columns, rawRowCh, coercedRowCh, coerceSpec)
-			// Wrap input to bump "processed" as rows enter coerce stage.
-			for r := range rawRowCh {
-				c.processed.Add(1)
-				// Feed a one-item channel into existing transformer to avoid
-				// changing its signature while counting here.
-				tmpIn := make(chan *transformer.Row, 1)
-				tmpOut := make(chan *transformer.Row, 1)
-				tmpIn <- r
-				close(tmpIn)
-				transformer.TransformLoopRows(ctx, spec.Storage.Postgres.Columns, tmpIn, tmpOut, coerceSpec)
-				// Drain tmpOut into real downstream.
-				select {
-				case outR, ok := <-tmpOut:
-					if ok {
-						select {
-						case coercedRowCh <- outR:
-						case <-ctx.Done():
-							outR.Free()
-							return
-						}
-					}
-				case <-ctx.Done():
-					r.Free()
-					return
-				}
-			}
+			// Long-lived streaming loop; no per-row channels.
+			transformer.TransformLoopRows(ctx, spec.Storage.Postgres.Columns, tapRawCh, coercedRowCh, coerceSpec)
 		}()
 	}
 
-	// Close coerced channel after readers & transformers complete.
+	// Close coercedRowCh after readers, tap, and transformers complete.
 	go func() {
 		wgR.Wait()
-		close(rawRowCh) // no more input to transformers
+		close(rawRowCh) // no more input into tap
+		wgTap.Wait()
 		wgT.Wait()
 		close(coercedRowCh)
 	}()
@@ -369,7 +375,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 					return nil
 				}
 				n := len(bVals)
-				// Call COPY.
+				// Call COPY via repository.
 				if _, err := copyFn(ctx, spec.Storage.Postgres.Columns, bVals); err != nil {
 					return err
 				}
@@ -383,8 +389,8 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				now := time.Now()
 				elapsed := now.Sub(start)
 				rate := int64(float64(c.inserted.Load()) / elapsed.Seconds())
-				log.Printf("batch #%d: rps=%v inserted=%d total_inserted=%d elapsed=%s since_last=%s",
-
+				log.Printf(
+					"batch #%d: rps=%v inserted=%d total_inserted=%d elapsed=%s since_last=%s",
 					batchNum,
 					rate,
 					n,
@@ -403,12 +409,12 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 			for {
 				select {
 				case <-ctx.Done():
-					// Drain and free to avoid backpressure on cancel.
 					// Context canceled (e.g., other loader failed): drain and free to avoid backpressure.
 					for r := range validCh {
 						r.Free()
 					}
 					return
+
 				case r, ok := <-validCh:
 					if !ok {
 						// Final flush on channel close.
@@ -422,10 +428,9 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 					bRows = append(bRows, r)
 					if len(bVals) >= batchSz {
 						if err := flush(); err != nil {
-							// Report, cancel upstream, then drain/freeze remaining rows to prevent hang.
+							// Report, cancel upstream, then drain & free remaining rows to prevent hang.
 							errCh <- RowErr{Err: err}
 							cancel()
-							// Drain & free remaining rows to prevent hang.
 							for r := range validCh {
 								r.Free()
 							}

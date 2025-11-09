@@ -249,6 +249,9 @@ func derefStr(p *string) string {
 }
 
 func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
+	// nRows := len(rows)
+	//	log.Printf("repo.CopyFrom: begin table=%s rows=%d", r.cfg.Table, nRows)
+
 	return r.pool.CopyFrom(ctx, splitFQN(r.cfg.Table), columns, pgx.CopyFromRows(rows))
 }
 

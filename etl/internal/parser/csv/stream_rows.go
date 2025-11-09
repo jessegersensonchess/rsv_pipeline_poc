@@ -60,26 +60,23 @@ func wrapWithLikvidaciScrub(r io.ReadCloser, enable bool) io.ReadCloser {
 // Header handling:
 //   - If options.has_header==true, the first line is treated as header and
 //     mapped via options.header_map (source-name -> canonical).
-//   - We then build a sourceIndex for each target column. Missing cols produce
-//     NULLs.
-//   - If has_header==false, we assume file columns already match 'columns'
-//     by position.
+//   - We then build dest→source mapping: colIx[targetIndex] = sourceIndex.
+//     Missing target columns map to -1 (NULL).
+//   - If has_header==false, we assume positional mapping (colIx[i] = i).
 //
 // Tuning/robustness (all optional via options):
 //   - comma (string; first rune used; default ',')
 //   - trim_space (bool; default true)
 //   - lazy_quotes (bool; default false) → csv.Reader.LazyQuotes
-//   - fields_per_record (int; 0=default, -1=variable width, >0=exact width)
-//   - stream_scrub_likvidaci (bool) → dataset-specific on-the-fly scrub
+//   - fields_per_record (int; 0=default, -1=variable, >0=enforce)
+//   - stream_scrub_likvidaci (bool) → dataset-specific byte scrub pass
 //
 // onErr(line, err) receives recoverable row errors (soft-drop).
-// This function is cancellation-aware and returns promptly on ctx.Done(), but
-// it **does not** close 'out'; the caller is responsible for closing channels.
 func StreamCSVRows(
 	ctx context.Context,
-	src io.ReadCloser, // caller-owned; will be closed by this function
-	columns []string, // target column order
-	opt config.Options, // parser options
+	src io.ReadCloser,
+	columns []string,
+	opt config.Options,
 	out chan<- *transformer.Row,
 	onErr func(line int, err error),
 ) error {
@@ -91,9 +88,9 @@ func StreamCSVRows(
 	trim := opt.Bool("trim_space", true)
 	hm := opt.StringMap("header_map")
 	lazy := opt.Bool("lazy_quotes", false)
-	fieldsPer := opt.Int("fields_per_record", 0) // 0=default; -1=variable; >0=enforce
+	fieldsPer := opt.Int("fields_per_record", 0)
 
-	// Dataset-specific streaming scrub (confirmed pattern).
+	// Optional streaming scrub for the `" v likvidaci""` glitch.
 	r := wrapWithLikvidaciScrub(src, opt.Bool("stream_scrub_likvidaci", false))
 
 	cr := csv.NewReader(r)
@@ -103,26 +100,17 @@ func StreamCSVRows(
 	if fieldsPer != 0 {
 		cr.FieldsPerRecord = fieldsPer
 	} else {
-		// Be a bit more tolerant by default on messy datasets.
-		cr.FieldsPerRecord = -1
+		cr.FieldsPerRecord = -1 // tolerant by default
 	}
 
-	// Build header mapping.
-	var srcToIdx map[string]int
-	colIx := make([]int, len(columns)) // input->output positional map (-1 missing)
+	// Build dest→source mapping.
+	colIx := make([]int, len(columns)) // colIx[target] = source index, or -1
+	for i := range colIx {
+		colIx[i] = -1
+	}
+
 	line := 0
-
-	read := func() ([]string, error) {
-		line++
-		return cr.Read()
-	}
-
-	// Cancellation check *before* first Read to avoid hanging in I/O.
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
+	read := func() ([]string, error) { line++; return cr.Read() }
 
 	// Header
 	if hasHeader {
@@ -133,13 +121,11 @@ func StreamCSVRows(
 			}
 			return err
 		}
-		// Normalize header cells → canonical names
-		srcToIdx = make(map[string]int, len(hdr))
+		srcToIdx := make(map[string]int, len(hdr))
 		for i, h := range hdr {
 			h = strings.TrimSpace(h)
 			if i == 0 {
-				// Strip UTF-8 BOM.
-				h = strings.TrimPrefix(h, "\uFEFF")
+				h = strings.TrimPrefix(h, "\uFEFF") // strip BOM
 			}
 			if mapped, ok := hm[h]; ok {
 				h = mapped
@@ -148,27 +134,24 @@ func StreamCSVRows(
 			}
 			srcToIdx[h] = i
 		}
-		for i, target := range columns {
-			if idx, ok := srcToIdx[target]; ok {
-				colIx[i] = idx
-			} else {
-				colIx[i] = -1
+		for t, target := range columns {
+			if si, ok := srcToIdx[target]; ok {
+				colIx[t] = si
 			}
 		}
 	} else {
-		// Positional mapping 1:1
 		for i := range columns {
-			colIx[i] = i
+			colIx[i] = i // positional
 		}
 	}
 
-	// Progress heartbeat for very large files.
+	// Progress heartbeat
 	const logEveryN = 200_000
 	lastLog := time.Now()
 	rowsSeen := 0
 
 	for {
-		// Cancellation check between records to avoid getting stuck in Read().
+		// cooperative cancel
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -186,33 +169,28 @@ func StreamCSVRows(
 			continue
 		}
 
-		// Build a pooled row with len(columns) and fill via mapping.
 		row := transformer.GetRow(len(columns))
-		// Initialize to NULLs, then place values where mapped.
-		for i := range row.V {
-			row.V[i] = nil
-		}
-
-		for i := 0; i < len(rec) && i < len(colIx); i++ {
-			outPos := colIx[i]
-			if outPos < 0 || outPos >= len(row.V) {
+		// Fill by TARGET index using dest→source mapping.
+		for t := range columns {
+			si := colIx[t]
+			if si < 0 || si >= len(rec) {
+				row.V[t] = nil
 				continue
 			}
-			v := rec[i]
+			v := rec[si]
 			if trim {
 				v = strings.TrimSpace(v)
 			}
 			if v == "" {
-				row.V[outPos] = nil
+				row.V[t] = nil
 			} else {
-				row.V[outPos] = v
+				row.V[t] = v
 			}
 		}
 
-		// Emit downstream, remain cancellation-aware.
+		// Emit
 		select {
 		case out <- row:
-			// progress
 			rowsSeen++
 			if rowsSeen%logEveryN == 0 || time.Since(lastLog) > 5*time.Second {
 				log.Printf("reader: line=%d emitted=%d", line, rowsSeen)
@@ -221,123 +199,6 @@ func StreamCSVRows(
 		case <-ctx.Done():
 			row.Free()
 			return ctx.Err()
-		}
-	}
-}
-
-// StreamCSVRows streams CSV into pooled *transformer.Row objects aligned to the
-// target 'columns' order. It reuses csv.Reader buffers (ReuseRecord=true) and
-// copies cells directly into row.V[i] as strings or nil.
-//
-// Header handling:
-//   - If options.has_header==true, the first line is treated as header and
-//     mapped via options.header_map (source-name -> canonical).
-//   - We then build a sourceIndex for each target column. Missing cols produce
-//     NULLs.
-//   - If has_header==false, we assume file columns already match 'columns'
-//     by position.
-//
-// onErr(line, err) receives recoverable row errors (soft-drop).
-func xxStreamCSVRows(
-	ctx context.Context,
-	src io.ReadCloser, // caller-owned; will be closed by this function
-	columns []string, // target column order
-	opt config.Options, // parser options (has_header, comma, trim_space, header_map)
-	out chan<- *transformer.Row,
-	onErr func(line int, err error),
-) error {
-	defer src.Close()
-
-	hasHeader := opt.Bool("has_header", true)
-	comma := opt.Rune("comma", ',')
-	trim := opt.Bool("trim_space", true)
-	hm := opt.StringMap("header_map")
-
-	r := src // io.ReadCloser
-	r = wrapWithLikvidaciScrub(r, opt.Bool("stream_scrub_likvidaci", false))
-
-	// cr := csv.NewReader(src)
-	cr := csv.NewReader(r)
-	cr.Comma = comma
-	cr.ReuseRecord = true
-	cr.FieldsPerRecord = -1 // allow variable; we validate per-row
-
-	var srcToIdx map[string]int
-	var colIx []int // len(columns), each index into input row, or -1 if missing
-	line := 0
-	read := func() ([]string, error) { line++; return cr.Read() }
-
-	// Header
-	if hasHeader {
-		hdr, err := read()
-		if err != nil {
-			return fmt.Errorf("read header: %w", err)
-		}
-		srcToIdx = make(map[string]int, len(hdr))
-		for i, h := range hdr {
-			h = strings.TrimSpace(h)
-			if i == 0 {
-				// Strip UTF-8 BOM.
-				h = strings.TrimPrefix(h, "\uFEFF")
-			}
-			if mapped, ok := hm[h]; ok {
-				h = mapped
-			} else {
-				h = strings.ReplaceAll(strings.ToLower(h), " ", "_")
-			}
-			srcToIdx[h] = i
-		}
-		colIx = make([]int, len(columns))
-		for i, target := range columns {
-			if idx, ok := srcToIdx[target]; ok {
-				colIx[i] = idx
-			} else {
-				colIx[i] = -1
-			}
-		}
-	} else {
-		// Positional mapping 1:1
-		colIx = make([]int, len(columns))
-		for i := range columns {
-			colIx[i] = i
-		}
-	}
-
-	for {
-		rec, err := read()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			if onErr != nil {
-				onErr(line, fmt.Errorf("csv read: %w", err))
-			}
-			continue
-		}
-
-		row := transformer.GetRow(len(columns))
-		for i := range columns {
-			srcIdx := colIx[i]
-			if srcIdx < 0 || srcIdx >= len(rec) {
-				row.V[i] = nil
-				continue
-			}
-			v := rec[srcIdx]
-			if trim {
-				v = strings.TrimSpace(v)
-			}
-			if v == "" {
-				row.V[i] = nil
-			} else {
-				row.V[i] = v
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			row.Free()
-			return ctx.Err()
-		case out <- row:
 		}
 	}
 }

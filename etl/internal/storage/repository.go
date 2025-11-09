@@ -20,7 +20,7 @@ import (
 type Repository interface {
 	// BulkUpsert is the legacy/buffered path for moderate input sizes.
 	// Implementations should perform an upsert (or insert) of the provided rows.
-	BulkUpsert(ctx context.Context, rows []map[string]any, keyColumns []string, dateColumn string) (int64, error)
+	//XBulkUpsert(ctx context.Context, rows []map[string]any, keyColumns []string, dateColumn string) (int64, error)
 
 	// CopyFrom inserts rows in batches (streaming path). Implementations that
 	// do not support native COPY can use multi-row INSERTs or bulk APIs.

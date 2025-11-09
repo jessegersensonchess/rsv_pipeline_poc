@@ -8,7 +8,7 @@
     "options": {
       "has_header": true,
       "comma": ",",
-      "trim_space": true,
+      "trim_space": false,
       "expected_fields": 9,
       "header_map": {
         "PČV": "pcv",
@@ -46,19 +46,6 @@
               "falsy":  ["0","f","false","no","n"]
             }
           ]
-        }
-      }
-    },
-
-    {
-      "kind": "coerce",
-      "options": {
-        "layout": "02.01.2006",
-        "types": {
-          "pcv": "int",
-          "platnost_od": "date",
-          "platnost_do": "date",
-          "aktualni": "bool"
         }
       }
     },
