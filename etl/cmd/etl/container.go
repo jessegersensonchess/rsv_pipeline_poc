@@ -535,6 +535,7 @@ func splitFQN(fqn string) []string {
 
 // errAgg aggregates errors
 type errAgg struct {
+	mu      sync.Mutex
 	limit   int
 	count   int
 	first   []string
@@ -545,11 +546,13 @@ func newErrAgg(limit int) *errAgg {
 	return &errAgg{limit: limit, buckets: make(map[string]int)}
 }
 func (a *errAgg) add(msg string) {
+	a.mu.Lock()
 	a.buckets[msg]++
 	if a.count < a.limit {
 		a.first = append(a.first, msg)
 	}
 	a.count++
+	a.mu.Unlock()
 }
 
 func requiredFromContract(p config.Pipeline) []string {

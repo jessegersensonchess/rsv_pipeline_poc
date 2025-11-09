@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"strings"
-	"time"
 
 	"etl/internal/config"
 	"etl/internal/transformer"
@@ -123,7 +122,9 @@ func StreamCSVRows(
 		}
 		srcToIdx := make(map[string]int, len(hdr))
 		for i, h := range hdr {
-			h = strings.TrimSpace(h)
+			if hasEdgeSpace(h) {
+				h = strings.TrimSpace(h)
+			}
 			if i == 0 {
 				h = strings.TrimPrefix(h, "\uFEFF") // strip BOM
 			}
@@ -146,8 +147,8 @@ func StreamCSVRows(
 	}
 
 	// Progress heartbeat
-	const logEveryN = 200_000
-	lastLog := time.Now()
+	const logEveryN = 50_000
+	// lastLog := time.Now()
 	rowsSeen := 0
 
 	for {
@@ -178,7 +179,7 @@ func StreamCSVRows(
 				continue
 			}
 			v := rec[si]
-			if trim {
+			if trim && hasEdgeSpace(v) {
 				v = strings.TrimSpace(v)
 			}
 			if v == "" {
@@ -192,13 +193,33 @@ func StreamCSVRows(
 		select {
 		case out <- row:
 			rowsSeen++
-			if rowsSeen%logEveryN == 0 || time.Since(lastLog) > 5*time.Second {
+			// if rowsSeen%logEveryN == 0 || time.Since(lastLog) > 5*time.Second {
+			if rowsSeen%logEveryN == 0 {
 				log.Printf("reader: line=%d emitted=%d", line, rowsSeen)
-				lastLog = time.Now()
 			}
 		case <-ctx.Done():
 			row.Free()
 			return ctx.Err()
 		}
 	}
+}
+
+// hasEdgeSpace reports whether s starts or ends with a space or common ASCII whitespace.
+// It uses only byte checks (fast path) and allocates nothing.
+func hasEdgeSpace(s string) bool {
+	n := len(s)
+	if n == 0 {
+		return false
+	}
+	// check first and last bytes
+	b0, b1 := s[0], s[n-1]
+
+	// ASCII whitespace fast-path
+	if b0 == ' ' || b0 == '\t' || b0 == '\n' || b0 == '\r' {
+		return true
+	}
+	if b1 == ' ' || b1 == '\t' || b1 == '\n' || b1 == '\r' {
+		return true
+	}
+	return false
 }

@@ -1,9 +1,9 @@
 package builtin
 
 import (
+	"etl/pkg/records"
 	"strconv"
 	"time"
-	"etl/pkg/records"
 )
 
 type Coerce struct {
@@ -13,18 +13,31 @@ type Coerce struct {
 
 func (c Coerce) Apply(in []records.Record) []records.Record {
 	for _, r := range in {
+		//if len(c.Types) == 0 {
+		//	return in
+		//}
 		for field, typ := range c.Types {
 			v, ok := r[field]
-			if !ok || v == nil { continue }
+			if !ok || v == nil {
+				continue
+			}
 			s, isStr := v.(string)
-			if !isStr { continue }
+			if !isStr {
+				continue
+			}
 			switch typ {
 			case "int":
-				if i, err := strconv.Atoi(s); err == nil { r[field] = i }
+				if i, err := strconv.Atoi(s); err == nil {
+					r[field] = i
+				}
 			case "bool":
-				if b, err := strconv.ParseBool(s); err == nil { r[field] = b }
+				if b, err := strconv.ParseBool(s); err == nil {
+					r[field] = b
+				}
 			case "date":
-				if t, err := time.Parse(c.Layout, s); err == nil { r[field] = t }
+				if t, err := time.Parse(c.Layout, s); err == nil {
+					r[field] = t
+				}
 			case "string":
 				// already string
 			}

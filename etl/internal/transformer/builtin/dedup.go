@@ -1,30 +1,11 @@
-// Package builtin contains reusable ETL transformers.
-//
-// DeDup is the primary, policy-driven de-duplication transformer for the
-// pipeline. It collapses duplicate records by a configured key and chooses
-// a winner according to a configurable policy:
-//
-//   - "keep-first"   : keep the earliest occurrence in the batch
-//   - "keep-last"    : keep the latest occurrence in the batch (default)
-//   - "most-complete": keep the record that has the most non-empty fields;
-//     ties break by "keep-last"
-//
-// This runs in-memory on a single batch (slice) of records. It is intended
-// to remove intra-batch duplicates *before* hitting the database, reducing
-// write amplification and avoiding constraint errors. The database should
-// still maintain UNIQUE/PK constraints as a backstop.
-//
-// Keys: a record's key is constructed from the concatenation of configured
-// fields as strings (nil -> "\x00"). For stable semantics across transforms,
-// run DeDup *after* Normalize/Coerce so that types/empty values are consistent.
 package builtin
 
 import (
+	"etl/pkg/records"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
-
-	"etl/pkg/records"
 )
 
 // DeDup implements a configurable, in-memory de-duplication policy.
@@ -71,6 +52,10 @@ func (d DeDup) Apply(in []records.Record) []records.Record {
 		prefer[f] = struct{}{}
 	}
 
+	// We’ll track whether a record is keyed in the first pass to avoid recomputing in the second.
+	keyed := make([]bool, len(in))
+
+	// Key construction function
 	keyOf := func(r records.Record) (string, bool) {
 		var b strings.Builder
 		for _, k := range d.Keys {
@@ -82,19 +67,12 @@ func (d DeDup) Apply(in []records.Record) []records.Record {
 			if b.Len() > 0 {
 				b.WriteByte('\x1f') // unlikely separator
 			}
-			switch t := v.(type) {
-			case nil:
-				b.WriteByte('\x00')
-			case string:
-				b.WriteString(t)
-			default:
-				// Use fmt to stabilize across types coerced earlier.
-				b.WriteString(fmt.Sprint(t))
-			}
+			appendKeyPart(&b, v)
 		}
 		return b.String(), true
 	}
 
+	// Score computation function
 	scoreOf := func(r records.Record) int {
 		// Count non-empty values; nil / "" don't count.
 		score := 0
@@ -122,9 +100,14 @@ func (d DeDup) Apply(in []records.Record) []records.Record {
 	for i, r := range in {
 		key, ok := keyOf(r)
 		if !ok {
-			// Keep passthrough records with missing key by appending later.
+			// Mark this as a non-keyed record.
+			keyed[i] = false
 			continue
 		}
+
+		// Mark this as a keyed record
+		keyed[i] = true
+
 		switch policy {
 		case "keep-first":
 			if _, exists := winners[key]; !exists {
@@ -143,28 +126,50 @@ func (d DeDup) Apply(in []records.Record) []records.Record {
 		}
 	}
 
-	// Compose output:
-	// 1) winners in stable index order (ascending index for keep-first/most-complete,
-	//    for keep-last this yields the position of the winning line).
-	out := make([]records.Record, 0, len(winners))
-	indexes := make([]int, 0, len(winners))
+	// Output the winners in order of their original index
+	winnersSorted := make([]slot, 0, len(winners))
 	for _, s := range winners {
-		indexes = append(indexes, s.index)
+		winnersSorted = append(winnersSorted, s)
 	}
-	sort.Ints(indexes)
-	posByIndex := make(map[int]records.Record, len(winners))
-	for _, s := range winners {
-		posByIndex[s.index] = s.rec
-	}
-	for _, idx := range indexes {
-		out = append(out, posByIndex[idx])
+	sort.Slice(winnersSorted, func(i, j int) bool {
+		return winnersSorted[i].index < winnersSorted[j].index
+	})
+
+	// Compose output with winners in order of appearance
+	out := make([]records.Record, len(winnersSorted))
+	for i, s := range winnersSorted {
+		out[i] = s.rec
 	}
 
-	// 2) Append pass-through (non-keyed) records in original order.
-	for _, r := range in {
-		if _, ok := keyOf(r); !ok {
+	// Append passthrough records (non-keyed records) in their original order
+	for i, r := range in {
+		if !keyed[i] {
 			out = append(out, r)
 		}
 	}
+
 	return out
+}
+
+// appendKeyPart appends a record's key field to the given string builder,
+// converting common types directly to string without fmt.Sprint (for performance).
+func appendKeyPart(b *strings.Builder, v any) {
+	switch t := v.(type) {
+	case nil:
+		b.WriteByte('\x00')
+	case string:
+		b.WriteString(t)
+	case int:
+		b.WriteString(strconv.Itoa(t))
+	case int64:
+		b.WriteString(strconv.FormatInt(t, 10))
+	case bool:
+		if t {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	default:
+		b.WriteString(fmt.Sprint(t))
+	}
 }
