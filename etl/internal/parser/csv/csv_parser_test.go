@@ -31,7 +31,7 @@ func TestParseSample(t *testing.T) {
 		},
 	})
 
-	recs, err := p.Parse(f)
+	recs, _, err := p.Parse(f)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

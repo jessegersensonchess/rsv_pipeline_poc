@@ -196,7 +196,7 @@ func (p *Parser) Parse(r io.Reader) ([]records.Record, int, error) {
 			headers[i] = fmt.Sprintf("col_%d", i)
 		}
 	}
-
+	limit := 400
 	// Read body rows.
 	for line := 1; ; line++ {
 		row, err := cr.Read()
@@ -204,15 +204,19 @@ func (p *Parser) Parse(r io.Reader) ([]records.Record, int, error) {
 			break
 		}
 		if err != nil {
-			// Soft-fail this row and continue.
-			log.Printf("Skipping row %d: %v", line, err)
+			if skipped < limit {
+				// Soft-fail this row and continue.
+				log.Printf("Skipping row %d: %v", line, err)
+			}
 			skipped++
 			continue
 		}
 
 		// Enforce expected width when known (by headers or explicit ExpectedFields).
 		if len(headers) > 0 && len(row) != len(headers) {
-			log.Printf("Skipping row %d: incorrect number of fields (expected %d, got %d)", line, len(headers), len(row))
+			if skipped < limit {
+				log.Printf("Skipping row %d: incorrect number of fields (expected %d, got %d)", line, len(headers), len(row))
+			}
 			skipped++
 			continue
 		}

@@ -49,6 +49,9 @@ func updateColumns(cols []string) []string {
 	return updates
 }
 
+// DEPRECATED: Prefer the streaming path (CopyFrom + LoadBatches).
+// BulkUpsert will be removed after migration is complete.
+
 func (r *Repository) BulkUpsert(ctx context.Context, recs []records.Record, keyColumns []string, dateColumn string) (int64, error) {
 	// Check if there's any record to process
 	if len(recs) == 0 {
@@ -87,20 +90,20 @@ func (r *Repository) BulkUpsert(ctx context.Context, recs []records.Record, keyC
 		return 0, fmt.Errorf("alter temp: %w", err)
 	}
 
-	// Step 3: Delete rows that match the key columns in the target table
-	del := fmt.Sprintf(
-		`DELETE FROM %s AS T
-		USING %s AS S
-		WHERE %s`,
-		fqTable, pgIdent(tmp), buildDeleteCondition(keyColumns),
-	)
-	if delTag, err := conn.Exec(ctx, del); err != nil {
-		return 0, fmt.Errorf("delete matching rows: %w", err)
-	} else {
-		log.Printf("Deleted %d rows from the target table.", delTag.RowsAffected())
-
+	// Step 3: Delete rows that match the key columns in the target table.
+	// If no keyColumns were provided, skip this step entirely.
+	if len(keyColumns) > 0 {
+		cond := buildDeleteCondition(keyColumns)
+		del := fmt.Sprintf(
+			`DELETE FROM %s AS T
+             USING %s AS S
+             WHERE %s`,
+			fqTable, pgIdent(tmp), cond,
+		)
+		if _, err := conn.Exec(ctx, del); err != nil {
+			return 0, fmt.Errorf("delete matching rows: %w", err)
+		}
 	}
-
 	// Step 4: Insert records into the staging table
 	colsWithRow := append(append([]string{}, cols...), "__rownum")
 	rows := make([][]any, 0, len(recs))
@@ -243,4 +246,27 @@ func derefStr(p *string) string {
 		return ""
 	}
 	return *p
+}
+
+func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
+	return r.pool.CopyFrom(ctx, splitFQN(r.cfg.Table), columns, pgx.CopyFromRows(rows))
+}
+
+// splitFQN converts "schema.table" into a pgx.Identifier {"schema","table"}.
+// If no dot is present, returns {"table"}.
+func splitFQN(fqn string) pgx.Identifier {
+	parts := strings.Split(fqn, ".")
+	id := make(pgx.Identifier, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			id = append(id, p)
+		}
+	}
+	return id
+}
+
+// Exec implements storage.Repository.Exec for Postgres.
+func (r *Repository) Exec(ctx context.Context, sql string) error {
+	_, err := r.pool.Exec(ctx, sql)
+	return err
 }

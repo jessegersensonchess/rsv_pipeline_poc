@@ -41,7 +41,17 @@ type Pipeline struct {
 	Transform []Transform `json:"transform"`
 
 	// Storage describes where transformed records are written (e.g., Postgres).
-	Storage Storage `json:"storage"`
+	Storage Storage       `json:"storage"`
+	Runtime RuntimeConfig `json:"runtime"`
+}
+
+// RuntimeConfig controls concurrency, batching, and channel buffer sizes.
+type RuntimeConfig struct {
+	ReaderWorkers    int `json:"reader_workers"`
+	TransformWorkers int `json:"transform_workers"`
+	LoaderWorkers    int `json:"loader_workers"`
+	BatchSize        int `json:"batch_size"`
+	ChannelBuffer    int `json:"channel_buffer"`
 }
 
 // Source identifies the data source. Additional kinds can be added over time.
@@ -114,6 +124,9 @@ type StoragePostgres struct {
 	// date (or similar). Some storage strategies may use this to prune/merge.
 	// Leave empty if not used.
 	DateColumn string `json:"date_column"`
+
+	// AutoCreateTable should the process automatically create the DB table
+	AutoCreateTable bool `json:"auto_create_table"`
 }
 
 // Options is a small helper to fetch typed values from arbitrary JSON maps
