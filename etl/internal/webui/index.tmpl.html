@@ -17,6 +17,18 @@
     .pill{display:inline-block; padding:2px 8px; background:#eee; border-radius:12px; margin-left:6px; font-size:12px}
     #search{float:right}
     .muted{color:#666}
+
+    /* Collapsible sections */
+    .card.collapsible > h3{
+      display:flex; align-items:center; justify-content:space-between; margin-top:0; cursor:pointer; user-select:none;
+    }
+    .card .section-body{margin-top:12px}
+    .card.collapsed .section-body{display:none}
+    .caret{
+      display:inline-block; transition:transform .15s ease; margin-left:12px; font-size:14px
+    }
+    .card.collapsed .caret{transform:rotate(-90deg)}
+    .toggle-help{font-size:12px; color:#888; margin-left:8px}
   </style>
 </head>
 <body>
@@ -28,44 +40,95 @@
       <label>Delimiter <input id="delim" type="text" size="2" value="," maxlength="1"></label>
       <label>Name (table) <input id="name" type="text" value="data_set_name"></label>
       <button id="btnProbe">Probe</button>
-      <input id="search" type="text" placeholder="Search…" />
+      <input id="search" type="text" placeholder="Search…"/>
     </div>
     <div id="probeStatus" class="muted" style="margin-top:8px;"></div>
   </div>
 
-  <div id="config" class="card" style="display:none">
-    <h3>Detected fields (edit types & required). Choose Primary Key.</h3>
-    <div id="fields"></div>
-    <div style="margin-top:12px" class="row">
-      <button id="btnETL">Run ETL</button>
-      <button id="btnDDL" class="secondary">View table schema</button>
-      <span id="etlStatus" class="muted"></span>
+  <div id="config" class="card collapsible" style="display:none">
+    <h3 aria-expanded="true">
+      Detected fields (edit types & required). Choose Primary Key.
+      <span class="toggle-help">click to collapse/expand</span>
+      <span class="caret">▼</span>
+    </h3>
+    <div class="section-body">
+      <div id="fields"></div>
+      <div style="margin-top:12px" class="row">
+        <button id="btnETL">Run ETL</button>
+        <button id="btnDDL" class="secondary">View table schema</button>
+        <span id="etlStatus" class="muted"></span>
+      </div>
     </div>
   </div>
 
-  <div id="ddlCard" class="card" style="display:none">
-    <h3>Table DDL</h3>
-    <code class="block" id="ddl"></code>
+  <div id="ddlCard" class="card collapsible" style="display:none">
+    <h3 aria-expanded="true">
+      Table DDL
+      <span class="toggle-help">click to collapse/expand</span>
+      <span class="caret">▼</span>
+    </h3>
+    <div class="section-body">
+      <code class="block" id="ddl"></code>
+    </div>
   </div>
 
-  <div id="samples" class="card" style="display:none">
-    <h3>Field samples</h3>
-    <div id="sampleRows"></div>
+  <div id="samples" class="card collapsible" style="display:none">
+    <h3 aria-expanded="true">
+      Field samples
+      <span class="toggle-help">click to collapse/expand</span>
+      <span class="caret">▼</span>
+    </h3>
+    <div class="section-body">
+      <div id="sampleRows"></div>
+    </div>
   </div>
 
-  <div id="results" class="card" style="display:none">
-    <h3>Search results</h3>
-    <div id="grid"></div>
+  <div id="results" class="card collapsible" style="display:none">
+    <h3 aria-expanded="true">
+      Search results
+      <span class="toggle-help">click to collapse/expand</span>
+      <span class="caret">▼</span>
+    </h3>
+    <div class="section-body">
+      <div id="grid"></div>
+    </div>
   </div>
 
 <script>
 let currentConfig = null;
-
 const typeOptions = ["text","integer","real","date","datetime","bool"];
 
 function $(id){ return document.getElementById(id); }
 function escapeHtml(s){ return s===null||s===undefined ? "" : String(s).replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m])); }
 
+/* Collapsible helpers */
+function initCollapsible(card){
+  if(!card) return;
+  const header = card.querySelector('h3');
+  const body = card.querySelector('.section-body');
+
+  if(!body){
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'section-body';
+    while(header.nextSibling){
+      bodyDiv.appendChild(header.nextSibling);
+    }
+    card.appendChild(bodyDiv);
+  }
+
+  header.addEventListener('click', (e)=>{
+    const tag = e.target.tagName;
+    if(tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT' || tag === 'LABEL') return;
+    card.classList.toggle('collapsed');
+    header.setAttribute('aria-expanded', String(!card.classList.contains('collapsed')));
+  });
+}
+
+function initAllCollapsibles(){
+  document.querySelectorAll('.card.collapsible').forEach(initCollapsible);
+}
+
+/* Workflow functions */
 async function probe(){
   $("probeStatus").textContent = "Probing…";
   const body = {
@@ -107,7 +170,6 @@ function renderConfig(){
       </tbody>
     </table>
   `;
-  // expose helpers
   window.setType = (i,v)=>{ currentConfig.fields[i].type = v; renderConfig(); }
   window.setRequired = (i,v)=>{ currentConfig.fields[i].required = v; }
   window.setPK = (name)=>{ currentConfig.primary_key = name; renderConfig(); }
@@ -115,7 +177,6 @@ function renderConfig(){
 
 async function runETL(){
   $("etlStatus").textContent = "Running ETL…";
-  // push source (could be edited)
   currentConfig.source = {
     url: $("url").value,
     delimiter: $("delim").value || ",",
@@ -157,7 +218,6 @@ async function doSearchNow(q){
   if(!res.ok){ grid.textContent = await res.text(); return; }
   const data = await res.json();
   if((data.rows||[]).length===0){ grid.textContent = "(no matches)"; return; }
-  // render table
   const cols = data.columns;
   grid.innerHTML = `
     <table>
@@ -169,14 +229,18 @@ async function doSearchNow(q){
   `;
 }
 
+/* Event bindings */
 $("btnProbe").addEventListener("click", probe);
 $("btnETL").addEventListener("click", runETL);
 $("btnDDL").addEventListener("click", viewDDL);
 $("search").addEventListener("input", (e)=>{
   const q = e.target.value;
   if(searchTimer) clearTimeout(searchTimer);
-  searchTimer = setTimeout(()=>doSearchNow(q), 160); // near-instant
+  searchTimer = setTimeout(()=>doSearchNow(q), 160);
 });
+
+/* Initialize collapsibles */
+document.addEventListener('DOMContentLoaded', initAllCollapsibles);
 </script>
 </body>
 </html>
