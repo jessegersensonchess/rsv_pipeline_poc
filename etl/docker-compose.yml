@@ -1,0 +1,157 @@
+services:
+  # ---------------- PostgreSQL ----------------
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-testdb}
+      TZ: ${TZ:-Europe/Prague}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Any .sql/.sql.gz/.sh in this dir runs ONCE on first init
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------- Microsoft SQL Server ----------------
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql
+    profiles: ["mssql"]
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: ${SA_PASSWORD}
+      MSSQL_PID: ${MSSQL_PID:-Developer}
+      MSSQL_AGENT_ENABLED: ${MSSQL_AGENT_ENABLED:-true}
+      TZ: ${TZ:-Europe/Prague}
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep sqlservr >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # One-shot initializer for MSSQL (runs after mssql is healthy)
+  mssql-init:
+    image: mcr.microsoft.com/mssql-tools:latest
+    container_name: mssql-init
+    profiles: ["mssql"]
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      SA_PASSWORD: ${SA_PASSWORD}
+      MSSQL_HOST: mssql
+      MSSQL_PORT: 1433
+      MSSQL_DB: ${MSSQL_DB:-MyDb}
+      APP_LOGIN: ${APP_LOGIN:-appuser}
+      APP_PASSWORD: ${APP_PASSWORD:-P@ssw0rd123!}
+    volumes:
+      - ./mssql/init.sh:/init.sh:ro
+    entrypoint: ["/bin/bash", "-lc", "/init.sh"]
+    restart: "no"
+
+  # ---------------- Go App (imports CSV -> MSSQL) ----------------
+  go-app-mssql:
+    build:
+      context: ./go-app
+      dockerfile: Dockerfile
+      network: host   # optional; only if your builder needs it
+    container_name: go-app-mssql
+    profiles: ["mssql"]
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+      DB_DRIVER: mssql
+      DB_DSN: >-
+        sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable
+      WORKERS: 8
+      BATCH_SIZE: 2500
+    volumes:
+      - ./data:/data:ro
+    command:
+      [
+        "/app/main",
+        "--db-driver=mssql",
+        "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable"
+      ]
+
+  # ---------------- Go App (imports CSV -> Postgres) ----------------
+  go-app-postgres:
+    build:
+      context: ./go-app
+      dockerfile: Dockerfile
+      network: host   # optional; only if your builder needs it
+    container_name: go-app-postgres
+    profiles: ["postgres"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+      DB_DRIVER: postgres
+      # Env fallback (your app can read this if flags are ignored)
+      DB_DSN: >-
+        postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable
+      WORKERS: 8
+      BATCH_SIZE: 3000
+    volumes:
+      - ./data:/data:ro
+    command:
+      [
+        "/app/main",
+        "--db-driver=postgres",
+        "--dsn", "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable"
+      ]
+
+  # ---------------- Go Unit Tests ----------------
+  go-tests:
+    image: golang:1.25-alpine
+    container_name: go-tests
+    profiles: ["test"]
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+    # Run all tests (verbose + race + cover); adjust as you like
+    command: ["/bin/sh", "-c", "
+      cd go-app && 
+      go test -v -coverprofile=coverage.out ./... &&
+      echo '\n--- Per-function coverage ---' &&
+      go tool cover -func=coverage.out
+    "]
+
+  # ---------------- linediff (set-based CSV diff helper) ----------------
+  linediff:
+    build:
+      context: ./go-app
+      dockerfile: Dockerfile-linediff
+    container_name: linediff
+    profiles: ["tools", "linediff"]
+    volumes:
+      - ./data:/data:ro    # read your CSVs from ./data on host
+    working_dir: /data     # user can reference files directly
+    entrypoint: ["/linediff"]  # built binary inside container
+
+volumes:
+  pgdata:
+  mssql-data:
+

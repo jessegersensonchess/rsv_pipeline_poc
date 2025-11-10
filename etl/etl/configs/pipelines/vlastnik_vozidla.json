@@ -1,0 +1,102 @@
+{
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "testdata/RSV_vlastnik_provozovatel_vozidla.csv"
+    }
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "has_header": true,
+      "comma": ",",
+      "trim_space": true,
+      "expected_fields": 9,
+	  "stream_scrub_likvidaci": true,
+      "header_map": {
+        "PČV": "pcv",
+        "Typ subjektu": "typ_subjektu",
+        "Vztah k vozidlu": "vztah_k_vozidlu",
+        "Aktuální": "aktualni",
+        "IČO": "ico",
+        "Název": "nazev",
+        "Adresa": "adresa",
+        "Datum od": "datum_od",
+        "Datum do": "datum_do"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "normalize"
+    },
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "pcv": "int",
+          "datum_od": "date",
+          "datum_do": "date",
+          "aktualni": "bool"
+        }
+      }
+    },
+	    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "vlastnik_vozidla",
+          "fields": [
+            { "name": "pcv",              "type": "int",   "required": true  },
+            { "name": "typ_subjektu",              "type": "text"                     },
+            { "name": "vztah_k_vozidlu",              "type": "text"                     },
+            { "name": "aktualni",         "type": "bool",
+              "truthy": ["1","t","true","yes","y"],
+              "falsy":  ["0","f","false","no","n"]
+            },
+            { "name": "ico",              "type": "int"                     },
+            { "name": "nazev",              "type": "text"                     },
+            { "name": "adresa",              "type": "text"                     },
+            { "name": "datum_od",      "type": "date",  "layout": "02.01.2006" },
+            { "name": "datum_do",      "type": "date",  "layout": "02.01.2006" }
+          ]
+        }
+      }
+    },
+    { 
+ 	  "kind": "dedupe", "options": {
+      "keys": ["pcv", "datum_od", "datum_do"],
+      "policy": "most-complete",
+      "prefer_fields": ["pcv"]
+    }},
+    {
+      "kind": "require",
+      "options": {
+        "fields": ["pcv"]
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "postgres": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "table": "public.vlastnik_vozidla",
+      "columns": [
+        "pcv",
+        "typ_subjektu",
+        "vztah_k_vozidlu",
+        "aktualni",
+        "ico",
+        "adresa",
+        "nazev",
+        "datum_od",
+        "datum_do",
+        "id"
+      ],
+      "key_columns": ["id"]
+    }
+  }
+}
+
