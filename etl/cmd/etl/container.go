@@ -364,7 +364,6 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 			defer wgL.Done()
 
 			start := time.Now()
-			lastFlush := start
 
 			// Local batch buffers: values for COPY and parallel slice of rows for Free().
 			bVals := make([][]any, 0, batchSz)
@@ -386,19 +385,16 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				// Update stats and log per-batch.
 				c.inserted.Add(int64(n))
 				batchNum := c.batches.Add(1)
-				now := time.Now()
-				elapsed := now.Sub(start)
-				rate := int64(float64(c.inserted.Load()) / elapsed.Seconds())
+				duration := time.Since(start)
+				rate := int64(float64(c.inserted.Load()) / duration.Seconds())
 				log.Printf(
-					"batch #%d: rps=%v inserted=%d total_inserted=%d elapsed=%s since_last=%s",
+					"batch=%d rps=%v inserted=%d total_inserted=%d elapsed=%s",
 					batchNum,
 					rate,
 					n,
 					c.inserted.Load(),
-					now.Sub(start).Truncate(time.Millisecond),
-					now.Sub(lastFlush).Truncate(time.Millisecond),
+					duration.Truncate(time.Millisecond),
 				)
-				lastFlush = now
 				// Reuse backing arrays.
 				bVals = bVals[:0]
 				bRows = bRows[:0]

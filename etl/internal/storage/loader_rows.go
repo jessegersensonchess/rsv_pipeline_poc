@@ -34,7 +34,7 @@ func (r *RowLike) Free() {
 }
 
 // LoadBatchesRows consumes pooled rows, builds [][]any batches, invokes copyFn,
-// and after a successful flush returns each row to the pool via Row.Free().
+// and after a flush returns each row to the pool via Row.Free().
 // It returns the total number of inserted rows.
 //
 // Cancellation: if ctx is canceled, the function stops promptly and returns
@@ -56,13 +56,13 @@ func LoadBatchesRows(
 	}
 
 	var (
-		total       int64
-		batches     int64
-		batchRows   = make([]*RowLike, 0, batchSize) // rows to Free() after COPY
-		slab        = make([][]any, 0, batchSize)    // [][]any view for COPY
-		start       = time.Now()
-		lastFlushTS = start
-		lastTotal   int64
+		total     int64
+		batches   int64
+		batchRows = make([]*RowLike, 0, batchSize) // rows to Free() after COPY
+		slab      = make([][]any, 0, batchSize)    // [][]any view for COPY
+		start     = time.Now()
+		//lastFlushTS = start
+		//lastTotal   int64
 	)
 
 	flush := func() error {
@@ -94,25 +94,22 @@ func LoadBatchesRows(
 
 		// Progress log: instantaneous rows/sec since last flush + totals.
 		batches++
-		now := time.Now()
-		sinceLast := now.Sub(lastFlushTS)
-		insertedSinceLast := total - lastTotal
+		//		now := time.Now()
+
+		now := time.Since(start).Truncate(time.Millisecond)
 		rps := float64(0)
-		if sinceLast > 0 {
-			rps = float64(insertedSinceLast) / sinceLast.Seconds()
+
+		if total > 0 {
+			rps = float64(total) / now.Seconds()
 		}
 		log.Printf(
-			"batch #%d: rps=%.0f inserted=%d total_inserted=%d elapsed=%s since_last=%s",
+			"batch #%d: rps=%.0f inserted=%d total_inserted=%d elapsed=%s",
 			batches,
 			rps,
 			n,
 			total,
-			now.Sub(start).Truncate(time.Millisecond),
-			sinceLast.Truncate(time.Millisecond),
+			now,
 		)
-		lastFlushTS = now
-		lastTotal = total
-
 		return nil
 	}
 
@@ -127,7 +124,7 @@ func LoadBatchesRows(
 				if err := flush(); err != nil {
 					return total, err
 				}
-				log.Printf("loader_rows: input closed, final_flush=%d total_inserted=%d", len(batchRows), total)
+				log.Printf("loader_rows: input closed, total_inserted=%d", total)
 
 				return total, nil
 			}

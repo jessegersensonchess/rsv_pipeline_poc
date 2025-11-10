@@ -123,6 +123,7 @@ func (r *Repository) BulkUpsert(ctx context.Context, recs []records.Record, keyC
 	}
 	//	var countRecords int64
 	countRecords, err := conn.CopyFrom(ctx, pgx.Identifier{tmp}, colsWithRow, pgx.CopyFromRows(rows))
+	log.Printf("DEBUG: countRecords %d rows", len(rows))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Detail != "" {
@@ -131,7 +132,7 @@ func (r *Repository) BulkUpsert(ctx context.Context, recs []records.Record, keyC
 		return 0, fmt.Errorf("copy into temp: %w", err)
 	} else {
 		log.Printf("Successfully inserted %d rows into the temporary table.", len(rows))
-		log.Printf("Successfully inserted %d rows into theCopy", countRecords)
+		log.Printf("Successfully inserted %d rows into DB", countRecords)
 	}
 
 	// Step 5: Simple Insert without ON CONFLICT clause
@@ -249,8 +250,8 @@ func derefStr(p *string) string {
 }
 
 func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
-	// nRows := len(rows)
-	//	log.Printf("repo.CopyFrom: begin table=%s rows=%d", r.cfg.Table, nRows)
+	//nRows := len(rows)
+	//log.Printf("DEBUG: repo.CopyFrom: begin table=%s rows=%d", r.cfg.Table, nRows)
 
 	return r.pool.CopyFrom(ctx, splitFQN(r.cfg.Table), columns, pgx.CopyFromRows(rows))
 }

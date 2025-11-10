@@ -20,6 +20,8 @@ func (f *fakeRepo) CopyFrom(ctx context.Context, columns []string, rows [][]any)
 }
 func (f *fakeRepo) Close() { f.closed = true }
 
+func (f *fakeRepo) Exec(ctx context.Context, sql string) error { return nil }
+
 // TestRegisterAndNew_Success verifies that registering a backend enables New()
 // to return the corresponding repository.
 func TestRegisterAndNew_Success(t *testing.T) {

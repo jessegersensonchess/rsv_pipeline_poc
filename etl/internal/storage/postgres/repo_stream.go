@@ -49,6 +49,7 @@ func LoadBatches(
 		}
 	)
 
+	fmt.Println("DEBUG: asdflkj")
 	for {
 		select {
 		case <-ctx.Done():
