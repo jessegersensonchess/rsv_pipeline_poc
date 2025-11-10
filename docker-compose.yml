@@ -120,6 +120,7 @@ services:
       TECH_CSV:   /data/RSV_technicke_prohlidky.csv
       OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla.csv
       ZPRAVY_CSV: /data/RSV_zpravy_vyrobce_zastupce.csv
+      VOZIDLA_VYRAZENA_CSV: /data/RSV_vozidla_vyrazena_z_provozu.csv
       WORKERS: 8
       BATCH_SIZE: 3000
     volumes:
