@@ -363,6 +363,7 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 
 	// Contract fields derived from headers/types.
 	fields := make([]jsonContractFieldSpec, 0, n)
+	requiredCounter := 0
 	for i, h := range headers {
 		col := jsonContractFieldSpec{
 			Name: normByHeader[h],
@@ -370,7 +371,10 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 		}
 		// Heuristic: mark integer column required if no empties in sample.
 		if allNonEmptySample(rows, i) && (inferred[i] == "integer") {
-			col.Required = true
+			if requiredCounter == 0 {
+				col.Required = true
+			}
+			requiredCounter++
 		}
 		// Add per-column layouts for date/timestamp if detected.
 		if inferred[i] == "date" || inferred[i] == "timestamp" {
