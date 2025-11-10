@@ -82,9 +82,6 @@ services:
       DB_DRIVER: mssql
       DB_DSN: >-
         sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable
-      VEHICLE_CSV:   /data/RSV_vypis_vozidel.csv
-      TECH_CSV:   /data/RSV_technicke_prohlidky.csv
-      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla.csv
       WORKERS: 8
       BATCH_SIZE: 2500
     volumes:
@@ -93,10 +90,7 @@ services:
       [
         "/app/main",
         "--db-driver=mssql",
-        "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable",
-        "--vehicle-csv=/data/RSV_vypis_vozidel.csv",
-        "--tech_csv=/data/RSV_technicke_prohlidky.csv",
-        "--ownership-csv=/data/RSV_vlastnik_provozovatel_vozidla.csv"
+        "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable"
       ]
 
   # ---------------- Go App (imports CSV -> Postgres) ----------------
@@ -116,11 +110,6 @@ services:
       # Env fallback (your app can read this if flags are ignored)
       DB_DSN: >-
         postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable
-      VEHICLE_CSV:   /data/RSV_vypis_vozidel.csv
-      TECH_CSV:   /data/RSV_technicke_prohlidky.csv
-      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla.csv
-      ZPRAVY_CSV: /data/RSV_zpravy_vyrobce_zastupce.csv
-      VOZIDLA_VYRAZENA_CSV: /data/RSV_vozidla_vyrazena_z_provozu.csv
       WORKERS: 8
       BATCH_SIZE: 3000
     volumes:
@@ -161,64 +150,6 @@ services:
       - ./data:/data:ro    # read your CSVs from ./data on host
     working_dir: /data     # user can reference files directly
     entrypoint: ["/linediff"]  # built binary inside container
-
-#  # ---------------- C# App (imports CSV -> Postgres) ----------------
-#  cs-app-postgres:
-#    build:
-#      context: ./cs-app
-#      dockerfile: Dockerfile
-#      network: host
-#    container_name: cs-app-postgres
-#    profiles: ["postgres"]
-#    depends_on:
-#      postgres:
-#        condition: service_healthy
-#    environment:
-#      TZ: ${TZ:-Europe/Prague}
-#      # env fallbacks (the app also accepts flags; we pass flags below)
-#      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
-#      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
-#      WORKERS: 8
-#      BATCH_SIZE: 1000
-#    volumes:
-#      - ./data:/data:ro
-#    command:
-#      [
-#        "--db-driver=postgres",
-#        "--dsn", "Host=postgres;Port=5432;Username=${POSTGRES_USER:-user};Password=${POSTGRES_PASSWORD:-password};Database=${POSTGRES_DB:-testdb}",
-#        "--ownership_csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv",
-#        "--vehicle_csv=/data/RSV_vypis_vozidel_20250902.csv"
-#      ]
-#
-  # ---------------- C# App (imports CSV -> MSSQL) ----------------
-  cs-app-mssql:
-    build:
-      context: ./cs-app
-      dockerfile: Dockerfile
-      network: host
-    container_name: cs-app-mssql
-    profiles: ["mssql"]
-    depends_on:
-      mssql:
-        condition: service_healthy
-    environment:
-      TZ: ${TZ:-Europe/Prague}
-      OWNERSHIP_CSV: /data/RSV_vlastnik_provozovatel_vozidla_20250901.csv
-      VEHICLE_CSV:   /data/RSV_vypis_vozidel_20250902.csv
-      WORKERS: 1
-      BATCH_SIZE: 1000
-    volumes:
-      - ./data:/data:ro
-    command:
-      [
-        "--db_driver=mssql",
-        "--dsn", "Server=mssql,1433;Database=${MSSQL_DB:-MyDb};User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True",
-        "--ownership_csv=/data/RSV_vlastnik_provozovatel_vozidla_20250901.csv",
-        "--ownership_workers=1",
-        "--tech_worker=1",
-        "--vehicle_csv=/data/RSV_vypis_vozidel_20250902.csv"
-      ]
-
 
 volumes:
   pgdata:
