@@ -9,7 +9,7 @@ import (
 	"flag"
 	"log"
 
-	"csv_header_fetcher/internal/webui"
+	"etl/internal/webui"
 )
 
 func main() {

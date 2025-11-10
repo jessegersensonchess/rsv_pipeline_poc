@@ -1,87 +1,183 @@
-{{/* A minimal form to run the CSV sampler. */}}
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8"/>
-  <title>csvprobe — web</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>csvprobe-web + ETL (SQLite)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Helvetica,Arial,sans-serif;line-height:1.35;margin:0;padding:0;background:#f7f7fb}
-    .wrap{max-width:960px;margin:2rem auto;padding:0 1rem}
-    .card{background:#fff;border-radius:14px;box-shadow:0 10px 25px rgba(0,0,0,.06);padding:1.25rem 1.5rem}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-    label{display:block;font-weight:600;margin:.25rem 0}
-    input,select,textarea{width:100%;padding:.6rem .7rem;border:1px solid #d9dbe9;border-radius:10px;background:#fff}
-    textarea{min-height:240px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
-    .row{margin:.75rem 0}
-    .actions{display:flex;gap:.75rem;margin-top:1rem}
-    .btn{background:#1f6feb;color:#fff;border:none;border-radius:10px;padding:.6rem 1rem;cursor:pointer}
-    .btn.secondary{background:#6e7781}
-    .muted{color:#6e7781;font-size:.9rem}
-    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px; line-height:1.4}
+    .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    .card{border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; box-shadow:0 1px 2px rgba(0,0,0,0.04)}
+    table{border-collapse:collapse; width:100%}
+    th,td{border:1px solid #eee; padding:8px; text-align:left}
+    select, input[type=text], input[type=url]{padding:8px;border:1px solid #ccc;border-radius:8px}
+    button{padding:8px 12px; border:0; border-radius:8px; background:#2d6cdf; color:#fff; cursor:pointer}
+    button.secondary{background:#666}
+    code.block{display:block; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px}
+    .pill{display:inline-block; padding:2px 8px; background:#eee; border-radius:12px; margin-left:6px; font-size:12px}
+    #search{float:right}
+    .muted{color:#666}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>csvprobe — web</h1>
-    <div class="card">
-      <form method="POST" action="/probe">
-        <div class="grid">
-          <div>
-            <div class="row">
-              <label for="url">CSV URL</label>
-              <input type="url" id="url" name="url" placeholder="https://example.com/test.csv" value="{{.URL}}" required>
-            </div>
-            <div class="row">
-              <label for="name">Connector name</label>
-              <input type="text" id="name" name="name" placeholder="technicke_prohlidky" value="{{.Name}}">
-              <div class="muted">Used for file path/table/contract name (normalized).</div>
-            </div>
-            <div class="row">
-              <label for="bytes">Bytes to sample</label>
-              <input type="number" id="bytes" name="bytes" min="1000" step="1000" value="{{if .Bytes}}{{.Bytes}}{{else}}20000{{end}}">
-            </div>
-          </div>
-          <div>
-            <div class="row">
-              <label for="delimiter">Delimiter</label>
-              <input type="text" id="delimiter" name="delimiter" maxlength="1" value="{{if .Delimiter}}{{.Delimiter}}{{else}},{{end}}">
-            </div>
-            <div class="row">
-              <label for="mode">Output</label>
-              <select id="mode" name="mode">
-                <option value="csv" {{if eq .Mode "csv"}}selected{{end}}>CSV (header,normalized,type)</option>
-                <option value="json" {{if eq .Mode "json"}}selected{{end}}>JSON config</option>
-              </select>
-            </div>
-            <div class="row">
-              <label for="date_pref">Date preference</label>
-              <select id="date_pref" name="date_pref">
-                <option value="auto" {{if or (eq .DatePref "") (eq .DatePref "auto")}}selected{{end}}>Auto (DMY &gt; ISO &gt; MDY)</option>
-                <option value="eu"   {{if eq .DatePref "eu"}}selected{{end}}>EU (prefer DMY)</option>
-                <option value="us"   {{if eq .DatePref "us"}}selected{{end}}>US (prefer MDY)</option>
-              </select>
-              <div class="muted">Affects tie-breakers for ambiguous numeric dates like 02.01.2006.</div>
-            </div>
-          </div>
-        </div>
-        <div class="actions">
-          <button class="btn" type="submit">Run</button>
-          <a class="btn secondary" href="/" role="button">Reset</a>
-          <a class="btn secondary" href="/api/probe?url={{.URL}}&name={{.Name}}&bytes={{.Bytes}}&delimiter={{.Delimiter}}&mode={{.Mode}}&date_pref={{.DatePref}}" role="button">API (GET)</a>
-        </div>
-      </form>
-    </div>
+  <h1>CSV Probe → Review → ETL → Browse</h1>
 
-    <div class="card" style="margin-top:1rem;">
-      <div class="row">
-        <label>Result</label>
-        <textarea class="mono" readonly>{{.ResultText}}</textarea>
-      </div>
+  <div class="card">
+    <div class="row">
+      <label>CSV URL <input id="url" type="url" size="60" placeholder="https://example.com/data.csv"></label>
+      <label>Delimiter <input id="delim" type="text" size="2" value="," maxlength="1"></label>
+      <label>Name (table) <input id="name" type="text" value="data_set_name"></label>
+      <button id="btnProbe">Probe</button>
+      <input id="search" type="text" placeholder="Search…" />
     </div>
-
-    <p class="muted">Tip: The API returns <span class="mono">text/plain</span> to make curl-ing easy.</p>
+    <div id="probeStatus" class="muted" style="margin-top:8px;"></div>
   </div>
+
+  <div id="config" class="card" style="display:none">
+    <h3>Detected fields (edit types & required). Choose Primary Key.</h3>
+    <div id="fields"></div>
+    <div style="margin-top:12px" class="row">
+      <button id="btnETL">Run ETL</button>
+      <button id="btnDDL" class="secondary">View table schema</button>
+      <span id="etlStatus" class="muted"></span>
+    </div>
+  </div>
+
+  <div id="ddlCard" class="card" style="display:none">
+    <h3>Table DDL</h3>
+    <code class="block" id="ddl"></code>
+  </div>
+
+  <div id="samples" class="card" style="display:none">
+    <h3>Field samples</h3>
+    <div id="sampleRows"></div>
+  </div>
+
+  <div id="results" class="card" style="display:none">
+    <h3>Search results</h3>
+    <div id="grid"></div>
+  </div>
+
+<script>
+let currentConfig = null;
+
+const typeOptions = ["text","integer","real","date","datetime","bool"];
+
+function $(id){ return document.getElementById(id); }
+function escapeHtml(s){ return s===null||s===undefined ? "" : String(s).replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m])); }
+
+async function probe(){
+  $("probeStatus").textContent = "Probing…";
+  const body = {
+    url: $("url").value,
+    delimiter: $("delim").value || ",",
+    name: $("name").value || "data",
+    bytes: 20000,
+    datepref: "auto"
+  };
+  const res = await fetch("/api/probe",{method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if(!res.ok){ $("probeStatus").textContent = "Probe error: "+await res.text(); return; }
+  const data = await res.json();
+  currentConfig = data.config;
+  renderConfig();
+  $("probeStatus").textContent = "Probe OK. Review fields & run ETL.";
+}
+
+function renderConfig(){
+  const c = currentConfig;
+  $("config").style.display = "";
+  const wrap = $("fields");
+  wrap.innerHTML = `
+    <table>
+      <thead><tr><th>Primary</th><th>Name</th><th>Type</th><th>Required</th><th>Actions</th></tr></thead>
+      <tbody>
+      ${c.fields.map((f,i)=>`
+        <tr>
+          <td><input type="radio" name="pk" ${c.primary_key===f.name ? "checked":""} onchange="setPK('${f.name}')"></td>
+          <td>${escapeHtml(f.name)}</td>
+          <td>
+            <select onchange="setType(${i}, this.value)">
+              ${typeOptions.map(t=>`<option value="${t}" ${f.type===t?'selected':''}>${t}</option>`).join('')}
+            </select>
+          </td>
+          <td><input type="checkbox" ${f.required?'checked':''} onchange="setRequired(${i}, this.checked)"></td>
+          <td><button class="secondary" onclick="sampleField('${f.name}')">Sample 10</button><span class="pill">${escapeHtml(f.type)}</span></td>
+        </tr>
+      `).join('')}
+      </tbody>
+    </table>
+  `;
+  // expose helpers
+  window.setType = (i,v)=>{ currentConfig.fields[i].type = v; renderConfig(); }
+  window.setRequired = (i,v)=>{ currentConfig.fields[i].required = v; }
+  window.setPK = (name)=>{ currentConfig.primary_key = name; renderConfig(); }
+}
+
+async function runETL(){
+  $("etlStatus").textContent = "Running ETL…";
+  // push source (could be edited)
+  currentConfig.source = {
+    url: $("url").value,
+    delimiter: $("delim").value || ",",
+    name: $("name").value || "data",
+  };
+  const res = await fetch("/api/etl",{method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(currentConfig)});
+  if(!res.ok){ $("etlStatus").textContent = "ETL error: "+await res.text(); return; }
+  $("etlStatus").textContent = "Done. Try View schema or Search.";
+  $("results").style.display = "none";
+  $("ddlCard").style.display = "none";
+  $("samples").style.display = "none";
+}
+
+async function viewDDL(){
+  const table = currentConfig?.source?.name || $("name").value;
+  const res = await fetch("/api/schema?table="+encodeURIComponent(table));
+  if(!res.ok){ $("ddl").textContent = await res.text(); $("ddlCard").style.display = ""; return; }
+  const data = await res.json();
+  $("ddl").textContent = data.ddl || "(no ddl found)";
+  $("ddlCard").style.display = "";
+}
+
+async function sampleField(field){
+  const table = currentConfig?.source?.name || $("name").value;
+  const res = await fetch(`/api/sample?table=${encodeURIComponent(table)}&field=${encodeURIComponent(field)}&limit=10`);
+  const out = $("sampleRows");
+  $("samples").style.display = "";
+  if(!res.ok){ out.innerHTML = "<div>"+escapeHtml(await res.text())+"</div>"; return; }
+  const data = await res.json();
+  out.innerHTML = `<h4>${escapeHtml(field)}</h4><ul>` + data.rows.map(v=>`<li>${escapeHtml(v)}</li>`).join("") + `</ul>`;
+}
+
+let searchTimer = null;
+async function doSearchNow(q){
+  const table = currentConfig?.source?.name || $("name").value;
+  const res = await fetch(`/api/search?table=${encodeURIComponent(table)}&q=${encodeURIComponent(q)}`);
+  const grid = $("grid");
+  $("results").style.display = "";
+  if(!res.ok){ grid.textContent = await res.text(); return; }
+  const data = await res.json();
+  if((data.rows||[]).length===0){ grid.textContent = "(no matches)"; return; }
+  // render table
+  const cols = data.columns;
+  grid.innerHTML = `
+    <table>
+      <thead><tr>${cols.map(c=>`<th>${escapeHtml(c)}</th>`).join('')}</tr></thead>
+      <tbody>
+        ${data.rows.map(r=>`<tr>${cols.map(c=>`<td>${escapeHtml(r[c])}</td>`).join('')}</tr>`).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+$("btnProbe").addEventListener("click", probe);
+$("btnETL").addEventListener("click", runETL);
+$("btnDDL").addEventListener("click", viewDDL);
+$("search").addEventListener("input", (e)=>{
+  const q = e.target.value;
+  if(searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(()=>doSearchNow(q), 160); // near-instant
+});
+</script>
 </body>
 </html>
 
