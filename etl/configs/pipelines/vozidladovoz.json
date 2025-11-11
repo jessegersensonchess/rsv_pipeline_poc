@@ -9,15 +9,15 @@
     "reader_workers": 1,
     "transform_workers": 4,
     "loader_workers": 1,
-    "batch_size": 10000,
-    "channel_buffer": 2048
+    "batch_size": 70000,
+    "channel_buffer": 128972
   },
   "parser": {
     "kind": "csv",
     "options": {
       "has_header": true, "stream_scrub_likvidaci": true,
       "comma": ",",
-      "trim_space": false,
+      "trim_space": true,
       "expected_fields": 3,
       "header_map": {
         "PČV": "pcv",

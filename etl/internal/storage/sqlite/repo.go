@@ -195,8 +195,10 @@ func (r *Repository) BulkUpsert(ctx context.Context, recs []map[string]any, keyC
 		if err != nil {
 			return 0, err
 		}
+
+		// Reuse args slice to avoid per-row allocs.
+		args := make([]any, len(keyCols))
 		for _, m := range recs {
-			args := make([]any, len(keyCols))
 			for i, k := range keyCols {
 				args[i] = m[k]
 			}
@@ -219,8 +221,8 @@ func (r *Repository) BulkUpsert(ctx context.Context, recs []map[string]any, keyC
 		return 0, err
 	}
 	var n int64
+	args := make([]any, len(cols))
 	for _, m := range recs {
-		args := make([]any, len(cols))
 		for i, c := range cols {
 			args[i] = m[c]
 		}
