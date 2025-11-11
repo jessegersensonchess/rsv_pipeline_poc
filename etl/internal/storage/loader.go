@@ -41,6 +41,10 @@ func LoadBatches(
 	if copyFn == nil {
 		return 0, fmt.Errorf("copyFn must not be nil")
 	}
+	// If the caller passes a pre-canceled context, fail fast deterministically.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	var (
 		total   int64
@@ -54,7 +58,12 @@ func LoadBatches(
 		if len(batch) == 0 {
 			return nil
 		}
+		// Recheck cancellation before doing IO.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := copyFn(ctx, columns, batch)
+		//n, err := copyFn(ctx, columns, batch)
 		total += n
 
 		// Reuse allocated slice; keep capacity to avoid churn.
@@ -91,6 +100,10 @@ func LoadBatches(
 	}
 
 	for {
+		// Optional: recheck here to avoid reading from 'in' if canceled mid-loop.
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()
