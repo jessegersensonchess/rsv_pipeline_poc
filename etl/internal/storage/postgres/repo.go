@@ -4,15 +4,11 @@ package postgres
 
 import (
 	"context"
-	"errors"
-	"etl/pkg/records"
 	"fmt"
-	"log"
 	"strings"
 
 	// Correct import for v5
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -47,129 +43,6 @@ func updateColumns(cols []string) []string {
 		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", pgIdent(col), pgIdent(col)))
 	}
 	return updates
-}
-
-// DEPRECATED: Prefer the streaming path (CopyFrom + LoadBatches).
-// BulkUpsert will be removed after migration is complete.
-
-func (r *Repository) BulkUpsert(ctx context.Context, recs []records.Record, keyColumns []string, dateColumn string) (int64, error) {
-	// Check if there's any record to process
-	if len(recs) == 0 {
-		return 0, nil
-	}
-
-	cols := r.cfg.Columns
-	if len(cols) == 0 {
-		return 0, fmt.Errorf("no columns configured")
-	}
-
-	tmp := "tmp_" + strings.ReplaceAll(r.cfg.Table, ".", "_")
-	fqTable := pgFQN(r.cfg.Table)
-
-	// Acquire the connection from the pool
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Release()
-
-	// Step 1: Create a temporary staging table (if it doesn't exist)
-	create := fmt.Sprintf(
-		"CREATE TEMP TABLE %s AS SELECT %s FROM %s WHERE false",
-		pgIdent(tmp), strings.Join(mapIdent(cols), ","), fqTable,
-	)
-	if _, err := conn.Exec(ctx, create); err != nil {
-		return 0, fmt.Errorf("create temp: %w", err)
-	}
-	defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS "+pgIdent(tmp)) }()
-
-	// Add a diagnostic column for CSV row numbers (1-based; header at 1)
-	if _, err := conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s ADD COLUMN __rownum integer", pgIdent(tmp),
-	)); err != nil {
-		return 0, fmt.Errorf("alter temp: %w", err)
-	}
-
-	// Step 3: Delete rows that match the key columns in the target table.
-	// If no keyColumns were provided, skip this step entirely.
-	if len(keyColumns) > 0 {
-		cond := buildDeleteCondition(keyColumns)
-		del := fmt.Sprintf(
-			`DELETE FROM %s AS T
-             USING %s AS S
-             WHERE %s`,
-			fqTable, pgIdent(tmp), cond,
-		)
-		if _, err := conn.Exec(ctx, del); err != nil {
-			return 0, fmt.Errorf("delete matching rows: %w", err)
-		}
-	}
-	// Step 4: Insert records into the staging table
-	colsWithRow := append(append([]string{}, cols...), "__rownum")
-	rows := make([][]any, 0, len(recs))
-	for i, rec := range recs {
-		row := make([]any, len(colsWithRow))
-		for j, c := range cols {
-			row[j] = rec[c]
-		}
-		row[len(colsWithRow)-1] = i + 2 // CSV data starts on line 2
-		rows = append(rows, row)
-	}
-
-	if len(recs) == 0 {
-		log.Println("No records to insert.")
-	} else {
-		log.Printf("Preparing to insert %d records.", len(recs))
-	}
-	//	var countRecords int64
-	countRecords, err := conn.CopyFrom(ctx, pgx.Identifier{tmp}, colsWithRow, pgx.CopyFromRows(rows))
-	log.Printf("DEBUG: countRecords %d rows", len(rows))
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Detail != "" {
-			return 0, fmt.Errorf("copy into temp: %s (%s)", pgErr.Detail, pgErr.SQLState())
-		}
-		return 0, fmt.Errorf("copy into temp: %w", err)
-	} else {
-		log.Printf("Successfully inserted %d rows into the temporary table.", len(rows))
-		log.Printf("Successfully inserted %d rows into DB", countRecords)
-	}
-
-	// Step 5: Simple Insert without ON CONFLICT clause
-	// Remove "id" from the columns and keyColumns list
-	colsWithoutID := []string{}
-	for _, col := range cols {
-		if col != "id" {
-			colsWithoutID = append(colsWithoutID, col)
-		}
-	}
-
-	// Remove "id" from keyColumns as well
-	keyColumnsWithoutID := []string{}
-	for _, keyCol := range keyColumns {
-		if keyCol != "id" {
-			keyColumnsWithoutID = append(keyColumnsWithoutID, keyCol)
-		}
-	}
-
-	// Update the insert query to exclude "id"
-	insert := fmt.Sprintf(
-		`INSERT INTO %s (%s)
-     SELECT %s FROM %s`,
-		fqTable,
-		strings.Join(mapIdent(colsWithoutID), ","), // Exclude "id" here
-		strings.Join(mapIdent(colsWithoutID), ","), // Exclude "id" from values as well
-		pgIdent(tmp),
-	)
-
-	log.Printf("Executing insert query: %s", insert)
-
-	_, err = conn.Exec(ctx, insert)
-	if err != nil {
-		return 0, fmt.Errorf("insert phase: %w", err)
-	}
-
-	return countRecords, nil
 }
 
 // buildDeleteCondition builds the condition for deleting matching rows based on key_columns and date_column.

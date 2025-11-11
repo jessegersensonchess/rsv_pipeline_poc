@@ -19,11 +19,11 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/datasource/file"
-	"etl/internal/ddlgen"
 	"etl/internal/parser"
 	csvparser "etl/internal/parser/csv"
 	"etl/internal/schema"
 	"etl/internal/storage"
+	"etl/internal/storage/ddl"
 	_ "etl/internal/storage/postgres" // register "postgres" backend
 	"etl/internal/transformer"
 	"etl/internal/transformer/builtin"
@@ -213,11 +213,11 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 	// Optional: create table from config/contract before any write.
 	if spec.Storage.Postgres.AutoCreateTable {
-		td, err := ddlgen.InferTableDef(spec)
+		td, err := ddl.InferTableDef(spec)
 		if err != nil {
 			return fmt.Errorf("infer table: %w", err)
 		}
-		ddl, err := ddlgen.BuildCreateTableSQL(td)
+		ddl, err := ddl.BuildCreateTableSQL(td)
 		if err != nil {
 			return fmt.Errorf("build ddl: %w", err)
 		}
@@ -387,14 +387,16 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				batchNum := c.batches.Add(1)
 				duration := time.Since(start)
 				rate := int64(float64(c.inserted.Load()) / duration.Seconds())
-				log.Printf(
-					"batch=%d rps=%v inserted=%d total_inserted=%d elapsed=%s",
-					batchNum,
-					rate,
-					n,
-					c.inserted.Load(),
-					duration.Truncate(time.Millisecond),
-				)
+				if batchNum%3 == 0 {
+					log.Printf(
+						"batch=%d rps=%v inserted=%d total_inserted=%d elapsed=%s",
+						batchNum,
+						rate,
+						n,
+						c.inserted.Load(),
+						duration.Truncate(time.Millisecond),
+					)
+				}
 				// Reuse backing arrays.
 				bVals = bVals[:0]
 				bRows = bRows[:0]

@@ -18,10 +18,6 @@ import (
 // Repository is a backend-agnostic contract used by the container.
 // Implementations (postgres, mysql, mssql, etc.) satisfy this interface.
 type Repository interface {
-	// BulkUpsert is the legacy/buffered path for moderate input sizes.
-	// Implementations should perform an upsert (or insert) of the provided rows.
-	//XBulkUpsert(ctx context.Context, rows []map[string]any, keyColumns []string, dateColumn string) (int64, error)
-
 	// CopyFrom inserts rows in batches (streaming path). Implementations that
 	// do not support native COPY can use multi-row INSERTs or bulk APIs.
 	CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error)

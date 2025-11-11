@@ -1,7 +1,7 @@
-// Package ddlgen provides helpers for generating SQL Data Definition Language
+// Package ddl provides helpers for generating SQL Data Definition Language
 // (DDL) statements. It focuses on deterministic, purely-functional string
 // generation to simplify testing and portability across databases.
-package ddlgen
+package ddl
 
 import (
 	"fmt"

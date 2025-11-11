@@ -6,15 +6,13 @@
 //
 // The adapter also reconciles method signatures between the storage.Repository
 // interface (which uses []map[string]any for legacy/buffered upserts) and the
-// concrete *postgres.Repository (which uses []records.Record). It performs a
-// lightweight conversion when delegating BulkUpsert.
+// concrete *postgres.Repository (which uses []records.Record).
 package postgres
 
 import (
 	"context"
 
 	"etl/internal/storage"
-	"etl/pkg/records"
 )
 
 // newRepository is a test hook that points to NewRepository by default.
@@ -43,7 +41,7 @@ func init() {
 
 // wrappedRepo implements storage.Repository by delegating to the concrete
 // *postgres.Repository while providing a Close method that calls the close
-// function returned by NewRepository. It also adapts the BulkUpsert signature.
+// function returned by NewRepository.
 type wrappedRepo struct {
 	*Repository
 	closeFn func()
@@ -51,22 +49,6 @@ type wrappedRepo struct {
 
 // Close implements storage.Repository.Close.
 func (w *wrappedRepo) Close() { w.closeFn() }
-
-// BulkUpsert implements storage.Repository.BulkUpsert by adapting the input
-// slice from []map[string]any to []records.Record and delegating.
-func (w *wrappedRepo) BulkUpsert(
-	ctx context.Context,
-	rows []map[string]any,
-	keyColumns []string,
-	dateColumn string,
-) (int64, error) {
-	recs := make([]records.Record, len(rows))
-	for i, m := range rows {
-		// records.Record is just map[string]any, so this is a zero-copy cast.
-		recs[i] = records.Record(m)
-	}
-	return w.Repository.BulkUpsert(ctx, recs, keyColumns, dateColumn)
-}
 
 // CopyFrom implements storage.Repository.CopyFrom by delegating directly.
 func (w *wrappedRepo) CopyFrom(

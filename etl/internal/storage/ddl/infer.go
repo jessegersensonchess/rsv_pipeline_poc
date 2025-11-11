@@ -1,7 +1,7 @@
-// Package ddlgen provides helpers to infer and generate SQL DDL from pipeline
+// Package ddl provides helpers to infer and generate SQL DDL from pipeline
 // configuration and (optionally) a validation contract. The functions here are
 // pure and deterministic, which makes them straightforward to test and reuse.
-package ddlgen
+package ddl
 
 import (
 	"encoding/json"
@@ -13,7 +13,7 @@ import (
 )
 
 // ColumnDef describes a single column in a table definition produced or
-// consumed by ddlgen. It intentionally uses simple, database-agnostic fields.
+// consumed by ddl. It intentionally uses simple, database-agnostic fields.
 //
 // Fields:
 //   - Name: logical column name (unquoted; quoting/escaping happens at render time)

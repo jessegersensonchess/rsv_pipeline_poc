@@ -1,4 +1,4 @@
-package ddlgen
+package ddl
 
 import (
 	"strconv"

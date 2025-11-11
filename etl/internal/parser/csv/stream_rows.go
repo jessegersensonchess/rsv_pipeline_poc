@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 
 	"etl/internal/config"
@@ -150,7 +149,7 @@ func StreamCSVRows(
 	// Progress heartbeat
 	const logEveryN = 50_000
 	// lastLog := time.Now()
-	rowsSeen := 0
+	//	rowsSeen := 0
 
 	for {
 		// cooperative cancel
@@ -193,11 +192,11 @@ func StreamCSVRows(
 		// Emit
 		select {
 		case out <- row:
-			rowsSeen++
+			//			rowsSeen++
 			// if rowsSeen%logEveryN == 0 || time.Since(lastLog) > 5*time.Second {
-			if rowsSeen%logEveryN == 0 {
-				log.Printf("reader: line=%d emitted=%d", line, rowsSeen)
-			}
+			//			if rowsSeen%logEveryN == 0 {
+			//				log.Printf("reader: line=%d emitted=%d", line, rowsSeen)
+			//			}
 		case <-ctx.Done():
 			row.Free()
 			return ctx.Err()
