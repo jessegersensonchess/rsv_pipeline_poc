@@ -10,6 +10,7 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/transformer"
+	"etl/internal/transformer/builtin"
 )
 
 // Before: import ( ... "bytes" "bufio" ... )
@@ -122,7 +123,7 @@ func StreamCSVRows(
 		}
 		srcToIdx := make(map[string]int, len(hdr))
 		for i, h := range hdr {
-			if hasEdgeSpace(h) {
+			if builtin.HasEdgeSpace(h) {
 				h = strings.TrimSpace(h)
 			}
 			if i == 0 {
@@ -179,7 +180,7 @@ func StreamCSVRows(
 				continue
 			}
 			v := rec[si]
-			if trim && hasEdgeSpace(v) {
+			if trim && builtin.HasEdgeSpace(v) {
 				v = strings.TrimSpace(v)
 			}
 			if v == "" {
@@ -202,24 +203,4 @@ func StreamCSVRows(
 			return ctx.Err()
 		}
 	}
-}
-
-// hasEdgeSpace reports whether s starts or ends with a space or common ASCII whitespace.
-// It uses only byte checks (fast path) and allocates nothing.
-func hasEdgeSpace(s string) bool {
-	n := len(s)
-	if n == 0 {
-		return false
-	}
-	// check first and last bytes
-	b0, b1 := s[0], s[n-1]
-
-	// ASCII whitespace fast-path
-	if b0 == ' ' || b0 == '\t' || b0 == '\n' || b0 == '\r' {
-		return true
-	}
-	if b1 == ' ' || b1 == '\t' || b1 == '\n' || b1 == '\r' {
-		return true
-	}
-	return false
 }

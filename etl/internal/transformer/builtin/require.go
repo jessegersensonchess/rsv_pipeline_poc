@@ -3,8 +3,7 @@ package builtin
 
 import "etl/pkg/records"
 
-// Require drops any record that lacks a non-nil, non-empty value
-// for all specified field names.
+// Require removes any record missing a value for all specified fields.
 type Require struct {
 	Fields []string
 }

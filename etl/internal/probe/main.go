@@ -5,7 +5,7 @@
 //
 // Example:
 //
-//	csvprobe -url="https://example.com/test.csv" -bytes=8192 -delimiter=";"
+//	csvprobe -url="https://example.com/test.csv" -bytes=8192 -delimiter=","
 package probe
 
 import (
@@ -90,7 +90,7 @@ func readCSVSample(data []byte, delim rune) ([]string, [][]string, error) {
 	//  - parse errors
 	//  - empty lines
 	//  - rows whose field count != header length
-	const maxRows = 200000
+	const maxRows = 150000 // hardcoded...move to config
 	rows := make([][]string, 0, maxRows)
 	want := len(headers)
 

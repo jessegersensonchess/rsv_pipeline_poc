@@ -61,14 +61,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ✅ Only transform JSON if -json was requested.
+	// Only transform JSON if -json was requested.
 	// Otherwise just stream CSV sample output unmodified.
 	if *flagJSON {
 		// Parse probe JSON
 		var cfg map[string]any
 		if err := json.Unmarshal(res.Body, &cfg); err == nil {
 
-			// ✅ Dig into cfg["storage"]["postgres"]["key_columns"]
+			// Dig into cfg["storage"]["postgres"]["key_columns"]
 			if storage, ok := cfg["storage"].(map[string]any); ok {
 				if pg, ok := storage["postgres"].(map[string]any); ok {
 					if kc, ok := pg["key_columns"].([]any); ok && len(kc) == 0 {

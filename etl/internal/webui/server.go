@@ -102,7 +102,7 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	}
 	maxBytes := req.Bytes
 	if maxBytes == 0 {
-		maxBytes = 20000
+		maxBytes = 30000
 	}
 
 	res, err := probe.Probe(probe.Options{

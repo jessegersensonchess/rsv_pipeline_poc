@@ -34,7 +34,7 @@ func (Normalize) Apply(in []records.Record) []records.Record {
 			}
 
 			// Trim only if edges look like whitespace.
-			if hasEdgeSpace(s) {
+			if HasEdgeSpace(s) {
 				s = strings.TrimSpace(s)
 			}
 
@@ -47,9 +47,9 @@ func (Normalize) Apply(in []records.Record) []records.Record {
 	return in
 }
 
-// hasEdgeSpace reports whether s starts or ends with common ASCII whitespace.
+// HasEdgeSpace reports whether s starts or ends with common ASCII whitespace.
 // Fast O(1) byte checks; no allocations.
-func hasEdgeSpace(s string) bool {
+func HasEdgeSpace(s string) bool {
 	n := len(s)
 	if n == 0 {
 		return false

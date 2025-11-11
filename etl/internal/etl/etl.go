@@ -1,4 +1,3 @@
-// internal/etl/etl.go
 package etl
 
 import (
@@ -146,12 +145,10 @@ func Run(ctx context.Context, dbPath string, cfg Config) error {
 			cols[i] = f.Name
 		}
 		return repo.InsertRows(ctx, cfg.Source.Name, cols, rows)
-
-		//		return repo.InsertRows(ctx, cfg.Source.Name, cfg.Fields, rows)
 	}
 
 	var seen int
-	maxRows := 2000
+	maxRows := 5000
 
 	for {
 		rec, err := r.Read()

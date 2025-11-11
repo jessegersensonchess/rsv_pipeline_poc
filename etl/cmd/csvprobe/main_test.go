@@ -103,8 +103,8 @@ func TestMain_JSONOutput(t *testing.T) {
 	//         Platnost od(date DMY), Platnost do(date DMY), Číslo protokolu(text), Aktuální(bool)
 	csv := "" +
 		"PČV,Typ,Stav,Kód STK,Název STK,Platnost od,Platnost do,Číslo protokolu,Aktuální\n" +
-		"123,A,ok,15,Some STK,02.01.2024,03.01.2024,ABC,1\n" +
-		"456,B,ok,22,Other STK,04.01.2024,05.01.2024,DEF,0\n"
+		"123,A,ok,15,Some STK,02.01.2024,03.01.2024,ABC,True\n" +
+		"456,B,ok,22,Other STK,04.01.2024,05.01.2024,DEF,False\n"
 
 	srv := makeTestServer(t, csv)
 
@@ -149,7 +149,7 @@ func TestMain_JSONOutput(t *testing.T) {
 		t.Errorf("expected coerce.layout 02.01.2006, got:\n%s", stdout)
 	}
 	// 5) coerce.types should include non-text fields, e.g., pcv (int) and aktualni (bool)
-	if !strings.Contains(stdout, `"pcv": "int"`) || !strings.Contains(stdout, `"aktualni": "bool"`) {
+	if !strings.Contains(stdout, `"pcv": "bigint"`) || !strings.Contains(stdout, `"aktualni": "bool"`) {
 		t.Errorf("expected coerce.types to include pcv:int and aktualni:bool, got:\n%s", stdout)
 	}
 	// 6) auto_create_table present in storage

@@ -12,6 +12,7 @@ import (
 	"log"
 	"strings"
 
+	"etl/internal/transformer/builtin"
 	"etl/pkg/records"
 )
 
@@ -224,7 +225,10 @@ func (p *Parser) Parse(r io.Reader) ([]records.Record, int, error) {
 		rec := make(records.Record, len(row))
 		for i, val := range row {
 			if p.opt.TrimSpace {
-				val = strings.TrimSpace(val)
+				// TrimSpace is cpu expensive, only do if leading || trailing space detected
+				if builtin.HasEdgeSpace(val) {
+					val = strings.TrimSpace(val)
+				}
 			}
 			key := keyFor(i, headers)
 			rec[key] = emptyToNil(val)
@@ -257,8 +261,13 @@ func emptyToNil(s string) any {
 // also strips a UTF-8 BOM from the first cell if present.
 func normalizeHeaders(h []string, opt Options) []string {
 	res := make([]string, len(h))
+	var c string
 	for i, col := range h {
-		c := strings.TrimSpace(col)
+		if builtin.HasEdgeSpace(col) {
+			c = strings.TrimSpace(col)
+		} else {
+			c = col
+		}
 		if i == 0 {
 			c = strings.TrimPrefix(c, utf8BOM)
 		}

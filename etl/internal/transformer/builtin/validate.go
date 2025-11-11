@@ -143,16 +143,32 @@ func (v *Validate) validateRecord(r records.Record) (bool, string) {
 			case float64:
 				// ok (json numbers)
 			case string:
-				if _, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64); err != nil {
+				if HasEdgeSpace(t) {
+					if _, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64); err != nil {
+						return false, fmt.Sprintf("field %q: %q not an int", fm.name, t)
+					}
+					return true, ""
+				}
+
+				if _, err := strconv.ParseInt(t, 10, 64); err != nil {
 					return false, fmt.Sprintf("field %q: %q not an int", fm.name, t)
 				}
+
 			default:
 				return false, fmt.Sprintf("field %q: type %T not int-convertible", fm.name, t)
 			}
 
 		case "bool":
 			// Lowercase once; also trim once.
-			s := strings.ToLower(strings.TrimSpace(asString(val)))
+			var s string
+			raw := asString(val)
+			// wrapped in HasEdgeSpace to save CPU cycles in hot-path
+			if HasEdgeSpace(raw) {
+				s = strings.ToLower(strings.TrimSpace(raw))
+			} else {
+				s = strings.ToLower(raw)
+			}
+
 			if s == "" {
 				// empty already handled above for required; allow for non-required
 				break
@@ -170,7 +186,10 @@ func (v *Validate) validateRecord(r records.Record) (bool, string) {
 					break
 				}
 			case string:
-				s := strings.TrimSpace(t)
+				var s string
+				if HasEdgeSpace(t) {
+					s = strings.TrimSpace(t)
+				}
 				if s == "" {
 					break
 				}

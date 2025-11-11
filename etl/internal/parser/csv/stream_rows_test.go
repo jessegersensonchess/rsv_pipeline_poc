@@ -14,6 +14,7 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/transformer"
+	"etl/internal/transformer/builtin"
 )
 
 /*
@@ -396,7 +397,7 @@ func Benchmark_StreamCSVRows(b *testing.B) {
 }
 
 /*
-TestHasEdgeSpace verifies that hasEdgeSpace reports true when a string starts
+TestHasEdgeSpace verifies that builtin.HasEdgeSpace reports true when a string starts
 or ends with common ASCII whitespace, and false otherwise.
 
 It exercises:
@@ -438,7 +439,7 @@ func TestHasEdgeSpace(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			got := hasEdgeSpace(tc.in)
+			got := builtin.HasEdgeSpace(tc.in)
 			if got != tc.want {
 				t.Fatalf("hasEdgeSpace(%q) = %v; want %v", tc.in, got, tc.want)
 			}
@@ -463,7 +464,7 @@ func TestHasEdgeSpace_NoAlloc(t *testing.T) {
 		s := s
 		t.Run("alloc:"+strings.ReplaceAll(s, "\n", "\\n"), func(t *testing.T) {
 			allocs := testingAllocsPerRun(1000, func() {
-				_ = hasEdgeSpace(s)
+				_ = builtin.HasEdgeSpace(s)
 			})
 			if allocs != 0 {
 				t.Fatalf("allocs=%g for input %q; want 0", allocs, s)
@@ -499,7 +500,7 @@ func BenchmarkHasEdgeSpace(b *testing.B) {
 		s := s
 		b.Run(summarize(s), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				if hasEdgeSpace(s) && len(s) == 0 { // prevent compiler from eliding
+				if builtin.HasEdgeSpace(s) && len(s) == 0 { // prevent compiler from eliding
 					b.Fatal("impossible")
 				}
 			}
