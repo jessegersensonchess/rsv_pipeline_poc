@@ -2,6 +2,46 @@
 // and streaming (channel-based, batched) execution modes. This file keeps the
 // CLI layer thin: it depends only on storage-agnostic interfaces and never
 // imports database drivers or backend-specific packages directly.
+//
+// Example XML pipeline config (minimal):
+//
+//	{
+//	  "source": { "kind": "file", "file": { "path": "sample.xml" } },
+//	  "parser": {
+//	    "kind": "xml",
+//	    "options": {
+//	      "record_element": "item",
+//	      "attr_prefix": "@",
+//	      "text_key": "text",
+//	      "trim_space": true,
+//	      "fields_per_record": 4
+//	    }
+//	  },
+//	  "storage": {
+//	    "kind": "postgres",
+//	    "postgres": {
+//	      "dsn": "postgres://user:pass@localhost:5432/db?sslmode=disable",
+//	      "table": "public.items",
+//	      "columns": ["@id","name","category","text"],
+//	      "auto_create_table": false
+//	    }
+//	  },
+//	  "runtime": {
+//	    "reader_workers": 1,
+//	    "transform_workers": 4,
+//	    "loader_workers": 1,
+//	    "batch_size": 10000,
+//	    "channel_buffer": 4096
+//	  }
+//	}
+//
+// sample.xml
+// <root>
+//
+//	<item id="1">Lead <name> Alpha </name><category> A </category></item>
+//	<item id="2"><name> Beta </name><category> B </category></item>
+//
+// </root>
 package main
 
 import (
@@ -21,9 +61,11 @@ import (
 	"etl/internal/datasource/file"
 	"etl/internal/parser"
 	csvparser "etl/internal/parser/csv"
+
+	//xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema"
+	"etl/internal/schema/ddl"
 	"etl/internal/storage"
-	"etl/internal/storage/ddl"
 	_ "etl/internal/storage/postgres" // register "postgres" backend
 	"etl/internal/transformer"
 	"etl/internal/transformer/builtin"
@@ -52,6 +94,16 @@ func buildParser(p config.Parser) (parser.Parser, error) {
 			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
 		}
 		return csvparser.NewParser(opt), nil
+		//	case "xml":
+		//		opt := xmlparser.Options{
+		//			RecordElement:  p.Options.String("record_element", ""),
+		//			TrimSpace:      p.Options.Bool("trim_space", true),
+		//			FieldMap:       p.Options.StringMap("field_map"),
+		//			AttrPrefix:     p.Options.String("attr_prefix", "@"),
+		//			TextKey:        p.Options.String("text_key", "text"),
+		//			ExpectedFields: p.Options.Int("expected_fields", 0),
+		//		}
+		//		return xmlparser.NewParser(opt), nil
 	default:
 		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
 	}
@@ -141,12 +193,11 @@ type RowErr struct {
 	Err  error
 }
 
-// runStreamed executes CSV → coerce → validate → storage in a fully streaming,
+// runStreamed executes CSV/XML → coerce → validate → storage in a fully streaming,
 // batched, concurrent fashion with pooled row reuse. It enforces fail-soft
 // semantics (bad rows are dropped before DB), aggregates parse/validate errors,
 // and emits both per-batch progress and end-of-run summary statistics.
 //
-
 // Per-batch logging is emitted on each successful flush with running totals.
 // runStreamed executes CSV → coerce → validate → storage in a fully streaming,
 // batched, concurrent fashion with pooled row reuse. It enforces fail-soft
@@ -155,14 +206,14 @@ type RowErr struct {
 //
 // Stats reported:
 //   - processed:    rows that entered the coerce stage (i.e., parsed successfully)
-//   - parseErrors:  lines the CSV reader could not parse (capped detailed logs)
+//   - parseErrors:  lines the CSV/XML reader could not parse (capped detailed logs)
 //   - validateDrop: rows dropped by required-field validation
 //   - inserted:     rows successfully flushed to the database
 //   - batches:      number of COPY batches flushed
 //
 // Concurrency model:
 //
-//	Reader (CSV; usually 1)
+//	Reader (CSV/XML; usually 1)
 //	     → tap (counts "processed")
 //	     → N Transformers (coerce, in-place on pooled rows)
 //	     → Validator (required fields; fail-soft)
@@ -183,7 +234,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	// Stats counters (atomic across goroutines).
 	type counters struct {
 		processed       atomic.Int64 // rows entering coerce stage
-		parseErrors     atomic.Int64 // csv read errors
+		parseErrors     atomic.Int64 // csv/xml read errors
 		validateRejects atomic.Int64 // rows rejected by validate
 		inserted        atomic.Int64 // rows inserted via COPY
 		batches         atomic.Int64 // COPY batches flushed
@@ -261,7 +312,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		}
 	}()
 
-	// --- 1) Reader (CSV streaming into pooled rows) ---
+	// --- 1) Reader (CSV/XML streaming into pooled rows) ---
 	var wgR sync.WaitGroup
 	wgR.Add(readerW)
 	for i := 0; i < readerW; i++ {
@@ -279,8 +330,18 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				return
 			}
 			// Stream into pooled rows aligned to storage.Columns.
-			if err := csvparser.StreamCSVRows(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
-				errCh <- RowErr{Err: err}
+			switch spec.Parser.Kind {
+			case "csv":
+				if err := csvparser.StreamCSVRows(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
+					errCh <- RowErr{Err: err}
+				}
+				//			case "xml":
+				//				if err := xmlparser.StreamXMLRows(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
+				//					errCh <- RowErr{Err: err}
+				//				}
+			default:
+				errCh <- RowErr{Err: fmt.Errorf("unsupported parser.kind=%s", spec.Parser.Kind)}
+				_ = src.Close()
 			}
 		}()
 	}
