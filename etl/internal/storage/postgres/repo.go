@@ -123,9 +123,6 @@ func derefStr(p *string) string {
 }
 
 func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
-	//nRows := len(rows)
-	//log.Printf("DEBUG: repo.CopyFrom: begin table=%s rows=%d", r.cfg.Table, nRows)
-
 	return r.pool.CopyFrom(ctx, splitFQN(r.cfg.Table), columns, pgx.CopyFromRows(rows))
 }
 
@@ -145,5 +142,31 @@ func splitFQN(fqn string) pgx.Identifier {
 // Exec implements storage.Repository.Exec for Postgres.
 func (r *Repository) Exec(ctx context.Context, sql string) error {
 	_, err := r.pool.Exec(ctx, sql)
+	if err != nil {
+		return fmt.Errorf("error executing SQL: %w", err)
+	}
 	return err
+
 }
+
+//func (r *Repository) Exec(ctx context.Context, sql string) error {
+//    log.Printf("DEBUG: Exec %v", sql)
+//
+//    tx, err := r.pool.BeginTx(ctx, nil)
+//    if err != nil {
+//        return fmt.Errorf("begin transaction: %w", err)
+//    }
+//    defer tx.Rollback()
+//
+//    _, err = tx.ExecContext(ctx, sql)
+//    if err != nil {
+//        return fmt.Errorf("error executing SQL: %w", err)
+//    }
+//
+//    if err := tx.Commit(); err != nil {
+//        return fmt.Errorf("commit transaction: %w", err)
+//    }
+//
+//    return nil
+//}
+//

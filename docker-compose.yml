@@ -10,12 +10,18 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-testdb}
       TZ: ${TZ:-Europe/Prague}
+      POSTGRES_LOGGING_COLLECTOR: "on"  # Enables log collection
+      POSTGRES_LOG_STATEMENT: "all"  # Logs all SQL statements
+      POSTGRES_LOG_ERROR_VERBOSITY: "verbose"  # More detailed error logs
+      POSTGRES_LOG_DESTINATION: "stderr"  # Ensure logs are output to stderr
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Any .sql/.sql.gz/.sh in this dir runs ONCE on first init
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro  # Custom config file
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s

@@ -197,6 +197,8 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	log.Printf("stream runtime: readers=%d transformers=%d loaders=%d batch=%d buffer=%d",
 		readerW, transW, loaderW, batchSz, bufSz)
 
+	log.Printf("Connecting to PostgreSQL with DSN: %s", spec.Storage.Postgres.DSN)
+
 	// Storage repository via factory (backend-agnostic).
 	repo, err := storage.New(ctx, storage.Config{
 		Kind:       spec.Storage.Kind,
@@ -207,24 +209,28 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		DateColumn: spec.Storage.Postgres.DateColumn,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("Error initializing repo: %w", err)
 	}
 	defer repo.Close()
 
 	// Optional: create table from config/contract before any write.
+	log.Printf("DEBUG: %v\n", spec.Storage.Postgres.AutoCreateTable)
 	if spec.Storage.Postgres.AutoCreateTable {
+		log.Printf("Preparing to create table: %s", spec.Storage.Postgres.Table)
+
 		td, err := ddl.InferTableDef(spec)
 		if err != nil {
-			return fmt.Errorf("infer table: %w", err)
+			return fmt.Errorf("ddl.InferTableDef: %w", err)
 		}
 		ddl, err := ddl.BuildCreateTableSQL(td)
+		log.Printf("DEBUG: ddl.BuildCreateTableSQL %v", ddl)
 		if err != nil {
-			return fmt.Errorf("build ddl: %w", err)
+			return fmt.Errorf("ddl.BuildCreateTableSQL: %w", err)
 		}
 		if err := repo.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("apply ddl: %w", err)
 		}
-		log.Printf("ensured table: %s", spec.Storage.Postgres.Table)
+		log.Printf("INFO: table_exists: %s", spec.Storage.Postgres.Table)
 	}
 
 	// COPY function remains abstracted behind the repository.
