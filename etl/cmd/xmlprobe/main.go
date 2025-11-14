@@ -15,7 +15,7 @@
 //
 //	# Parse using a config (high-perf flags available)
 //	xmlprobe -i sample.xml -config config.json \
-//	    -workers 9 -queue 2048 -bufsize 65536 -zerocopy -ultrafast -schema
+//	    -workers 9 -queue 256 -bufsize 65536 -zerocopy -ultrafast -schema
 package main
 
 import (

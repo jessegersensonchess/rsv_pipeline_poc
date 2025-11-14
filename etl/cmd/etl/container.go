@@ -2,46 +2,6 @@
 // and streaming (channel-based, batched) execution modes. This file keeps the
 // CLI layer thin: it depends only on storage-agnostic interfaces and never
 // imports database drivers or backend-specific packages directly.
-//
-// Example XML pipeline config (minimal):
-//
-//	{
-//	  "source": { "kind": "file", "file": { "path": "sample.xml" } },
-//	  "parser": {
-//	    "kind": "xml",
-//	    "options": {
-//	      "record_element": "item",
-//	      "attr_prefix": "@",
-//	      "text_key": "text",
-//	      "trim_space": true,
-//	      "fields_per_record": 4
-//	    }
-//	  },
-//	  "storage": {
-//	    "kind": "postgres",
-//	    "postgres": {
-//	      "dsn": "postgres://user:pass@localhost:5432/db?sslmode=disable",
-//	      "table": "public.items",
-//	      "columns": ["@id","name","category","text"],
-//	      "auto_create_table": false
-//	    }
-//	  },
-//	  "runtime": {
-//	    "reader_workers": 1,
-//	    "transform_workers": 4,
-//	    "loader_workers": 1,
-//	    "batch_size": 10000,
-//	    "channel_buffer": 4096
-//	  }
-//	}
-//
-// sample.xml
-// <root>
-//
-//	<item id="1">Lead <name> Alpha </name><category> A </category></item>
-//	<item id="2"><name> Beta </name><category> B </category></item>
-//
-// </root>
 package main
 
 import (
@@ -61,8 +21,6 @@ import (
 	"etl/internal/datasource/file"
 	"etl/internal/parser"
 	csvparser "etl/internal/parser/csv"
-
-	//xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema"
 	"etl/internal/schema/ddl"
 	"etl/internal/storage"
@@ -94,16 +52,6 @@ func buildParser(p config.Parser) (parser.Parser, error) {
 			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
 		}
 		return csvparser.NewParser(opt), nil
-		//	case "xml":
-		//		opt := xmlparser.Options{
-		//			RecordElement:  p.Options.String("record_element", ""),
-		//			TrimSpace:      p.Options.Bool("trim_space", true),
-		//			FieldMap:       p.Options.StringMap("field_map"),
-		//			AttrPrefix:     p.Options.String("attr_prefix", "@"),
-		//			TextKey:        p.Options.String("text_key", "text"),
-		//			ExpectedFields: p.Options.Int("expected_fields", 0),
-		//		}
-		//		return xmlparser.NewParser(opt), nil
 	default:
 		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
 	}
@@ -223,6 +171,7 @@ type RowErr struct {
 // channelBuffer). The loader calls COPY in batches for throughput and, on any
 // fatal DB error, cancels the context and drains/frees remaining rows to avoid
 // goroutine leaks or deadlocks.
+
 func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	// Tunables (12-factor): config first, env fallback.
 	readerW := pickInt(spec.Runtime.ReaderWorkers, getenvInt("ETL_READER_WORKERS", 1))
@@ -335,10 +284,6 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				if err := csvparser.StreamCSVRows(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
 					errCh <- RowErr{Err: err}
 				}
-				//			case "xml":
-				//				if err := xmlparser.StreamXMLRows(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
-				//					errCh <- RowErr{Err: err}
-				//				}
 			default:
 				errCh <- RowErr{Err: fmt.Errorf("unsupported parser.kind=%s", spec.Parser.Kind)}
 				_ = src.Close()
