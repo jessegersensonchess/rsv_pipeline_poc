@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -167,11 +168,15 @@ func parseOneRecord(b []byte, comp Compiled, useUltra bool) (Record, error) {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
+			// Here, we need to properly handle parsing errors
 			if err == io.EOF || isTruncErr(err) {
 				return record, nil
 			}
-			return nil, err
+			// Return the error if the XML is invalid
+			return nil, fmt.Errorf("failed to parse XML: %w", err)
 		}
+
+		// Process XML tokens here...
 		switch t := tok.(type) {
 		case xml.StartElement:
 			if !inRecord {
