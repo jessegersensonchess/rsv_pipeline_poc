@@ -26,11 +26,33 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
+	"etl/internal/config"
 	"etl/internal/inspect"
 	xmlparser "etl/internal/parser/xml"
+	"etl/internal/schema/ddl"
+	"etl/internal/storage"
+	_ "etl/internal/storage/postgres" // register "postgres" backend
 )
+
+// xmlStorageJSON is the JSON shape for xmlprobe's storage block.
+// It is flat and uses lowercase names, but we also tolerate "Kind".
+type xmlStorageJSON struct {
+	Kind            string   `json:"kind"` // preferred
+	DSN             string   `json:"dsn"`
+	Table           string   `json:"table"`
+	Columns         []string `json:"columns"`
+	KeyColumns      []string `json:"key_columns"`
+	DateColumn      string   `json:"date_column"`
+	AutoCreateTable bool     `json:"auto_create_table"`
+}
+
+// xmlStorageJSONCompat captures legacy/alternative keys we want to support.
+type xmlStorageJSONCompat struct {
+	Kind string `json:"Kind"` // accept capitalized Kind as in your example
+}
 
 func main() {
 	var (
@@ -52,9 +74,12 @@ func main() {
 		bufSize     = flag.Int("bufsize", 1024, "reader buffer size for non-zerocopy (bytes; 0=1<<20)")
 		zeroCopy    = flag.Bool("zerocopy", false, "use zero-copy sharding (reads entire file into memory)")
 		ultraFast   = flag.Bool("ultrafast", false, "enable schema-like raw byte fast path")
-		schema      = flag.Bool("schema", false, "alias of -ultrafast (kept for parity)")
+		schemaFlag  = flag.Bool("schema", false, "alias of -ultrafast (kept for parity)")
 		preserveOrd = flag.Bool("preserve_order", false, "preserve record order (lower throughput)")
 		orderWindow = flag.Int("order_window", 0, "bounded reordering window (0=unordered)")
+
+		// New: load mode (step 3 of ETL)
+		loadToStorage = flag.Bool("load", false, "load parsed records into storage defined in config.storage instead of printing NDJSON")
 	)
 	flag.Parse()
 
@@ -103,27 +128,54 @@ func main() {
 			return
 		}
 		if *generateCfg {
+			// Starter XML parser config
 			cfg := inspect.StarterConfigFrom(rep)
-			b, err := xmlparser.MarshalConfigJSON(cfg, *pretty)
+
+			// Convert to a generic map so we can append "storage"
+			b, err := xmlparser.MarshalConfigJSON(cfg, false)
 			if err != nil {
 				log.Fatalf("marshal starter config: %v", err)
 			}
-			os.Stdout.Write(b)
+
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				log.Fatalf("unmarshal starter config to map: %v", err)
+			}
+
+			// Auto-infer storage.columns from fields + lists
+			cols := inferColumnsFromConfig(cfg)
+
+			// Attach storage stub (flat JSON with lowercase keys)
+			storageJSON := xmlStorageJSON{
+				Kind:            "postgres",
+				DSN:             "",
+				Table:           "",
+				Columns:         cols,
+				KeyColumns:      nil,
+				DateColumn:      "",
+				AutoCreateTable: false,
+			}
+			m["storage"] = storageJSON
+
+			enc := json.NewEncoder(os.Stdout)
 			if *pretty {
-				os.Stdout.Write([]byte("\n"))
+				enc.SetIndent("", "  ")
+			}
+			if err := enc.Encode(m); err != nil {
+				log.Fatalf("encode starter config with storage: %v", err)
 			}
 			return
 		}
 	}
 
-	// ---- PARSE MODE (default when no discovery/gen flags) ----
+	// ---- PARSE / LOAD MODE (default when no discovery/gen flags) ----
 	if *configPath == "" {
 		fmt.Fprintln(os.Stderr, "No action specified. Use -discover or -generate-config, or provide -config to parse.")
 		flag.Usage()
 		os.Exit(2)
 	}
 
-	// Load & compile config.
+	// Load & compile XML parser config (parser-only view).
 	cfg, err := readConfig(*configPath)
 	if err != nil {
 		log.Fatalf("read config: %v", err)
@@ -133,14 +185,35 @@ func main() {
 		log.Fatalf("compile config: %v", err)
 	}
 
+	// Optional: load storage block and corresponding minimal pipeline spec if requested.
+	var storeCfg *storage.Config
+	var pipeSpec *config.Pipeline
+	if *loadToStorage {
+		sc, spec, err := readStorageConfigAsPipeline(*configPath)
+		if err != nil {
+			log.Fatalf("read storage config: %v", err)
+		}
+		if sc.Kind == "" {
+			log.Fatalf("config.storage.kind is required when using -load")
+		}
+		if spec.Storage.Postgres.Table == "" {
+			log.Fatalf("config.storage.table is required when using -load")
+		}
+		if len(spec.Storage.Postgres.Columns) == 0 {
+			log.Fatalf("config.storage.columns must be non-empty when using -load")
+		}
+		storeCfg = &sc
+		pipeSpec = &spec
+	}
+
 	// Build Options from flags.
 	opts := xmlparser.Options{
 		Workers:       *workers,
 		Queue:         *queue,
 		BufSize:       *bufSize,
 		ZeroCopy:      *zeroCopy,
-		UltraFast:     *ultraFast || *schema,
-		Schema:        *schema,
+		UltraFast:     *ultraFast || *schemaFlag,
+		Schema:        *schemaFlag,
 		PreserveOrder: *preserveOrd,
 		OrderWindow:   *orderWindow,
 	}
@@ -160,7 +233,13 @@ func main() {
 		rdr = f
 	}
 
-	runParser(rdr, data, cfg.RecordTag, comp, opts)
+	if storeCfg != nil && pipeSpec != nil {
+		if err := runParserAndLoad(rdr, data, cfg.RecordTag, comp, opts, storeCfg, pipeSpec); err != nil {
+			log.Fatalf("%v", err)
+		}
+	} else {
+		runParser(rdr, data, cfg.RecordTag, comp, opts)
+	}
 }
 
 // runParser executes ParseStream and NDJSON-prints records to stdout.
@@ -192,6 +271,108 @@ func runParser(r io.Reader, data []byte, recordTag string, comp xmlparser.Compil
 	}
 }
 
+// runParserAndLoad parses XML and bulk-loads into configured storage.
+// It uses the same abstraction level as container.go:
+//   - storage.New(repo)
+//   - ddl.InferTableDef(spec) + BuildCreateTableSQL + repo.Exec (if AutoCreateTable)
+//   - repo.CopyFrom for COPY.
+func runParserAndLoad(
+	r io.Reader,
+	data []byte,
+	recordTag string,
+	comp xmlparser.Compiled,
+	opts xmlparser.Options,
+	storeCfg *storage.Config,
+	spec *config.Pipeline,
+) error {
+	out := make(chan xmlparser.Record, maxInt(4, opts.Queue))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Storage repo backed by factory
+	repo, err := storage.New(ctx, *storeCfg)
+	if err != nil {
+		return fmt.Errorf("storage init: %w", err)
+	}
+	defer repo.Close()
+
+	// Optional: create table from config/contract before any write,
+	// using the same pattern as container.go.
+	if spec.Storage.Postgres.AutoCreateTable {
+		td, err := ddl.InferTableDef(*spec)
+		if err != nil {
+			return fmt.Errorf("infer table: %w", err)
+		}
+		ddlSQL, err := ddl.BuildCreateTableSQL(td)
+		if err != nil {
+			return fmt.Errorf("build ddl: %w", err)
+		}
+		if err := repo.Exec(ctx, ddlSQL); err != nil {
+			return fmt.Errorf("apply ddl: %w", err)
+		}
+		log.Printf("ensured table: %s", spec.Storage.Postgres.Table)
+	}
+
+	// COPY function remains abstracted behind the repository.
+	copyFn := func(ctx context.Context, columns []string, rows [][]any) (int64, error) {
+		return repo.CopyFrom(ctx, columns, rows)
+	}
+
+	// Cancellation: if loader hits a fatal DB error, cancel upstream quickly.
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- xmlparser.ParseStream(ctx, r, data, recordTag, comp, opts, out)
+		close(out)
+	}()
+
+	const batchSize = 5000
+	cols := storeCfg.Columns
+	rows := make([][]any, 0, batchSize)
+	var inserted int64
+	batchNum := 0
+
+	flush := func() error {
+		if len(rows) == 0 {
+			return nil
+		}
+		n, err := copyFn(ctx, cols, rows)
+		if err != nil {
+			return err
+		}
+		inserted += n
+		batchNum++
+		log.Printf("batch=%d inserted=%d total_inserted=%d", batchNum, n, inserted)
+		rows = rows[:0]
+		return nil
+	}
+
+	for rec := range out {
+		row := recordToRow(rec, cols)
+		rows = append(rows, row)
+		if len(rows) >= batchSize {
+			if err := flush(); err != nil {
+				cancel()
+				return fmt.Errorf("copy: %w", err)
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		cancel()
+		return fmt.Errorf("copy: %w", err)
+	}
+
+	if err := <-errCh; err != nil {
+		return fmt.Errorf("parse: %w", err)
+	}
+
+	log.Printf("load complete: total_inserted=%d batches=%d", inserted, batchNum)
+	return nil
+}
+
 func readConfigRecordTag(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -210,6 +391,59 @@ func readConfig(path string) (xmlparser.Config, error) {
 		return xmlparser.Config{}, err
 	}
 	return xmlparser.ParseConfigJSON(b)
+}
+
+// readStorageConfigAsPipeline pulls the "storage" block from the XML config JSON,
+// maps it both into storage.Config (for storage.New) and a minimal config.Pipeline
+// (for ddl.InferTableDef), using a flat JSON shape. It also tolerates "Kind".
+func readStorageConfigAsPipeline(path string) (storage.Config, config.Pipeline, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return storage.Config{}, config.Pipeline{}, err
+	}
+	var wrapper struct {
+		Storage json.RawMessage `json:"storage"`
+	}
+	if err := json.Unmarshal(b, &wrapper); err != nil {
+		return storage.Config{}, config.Pipeline{}, err
+	}
+	if len(wrapper.Storage) == 0 {
+		return storage.Config{}, config.Pipeline{}, fmt.Errorf("missing storage block")
+	}
+
+	var sj xmlStorageJSON
+	_ = json.Unmarshal(wrapper.Storage, &sj)
+
+	// Compatibility: accept "Kind" if "kind" was not set.
+	if sj.Kind == "" {
+		var compat xmlStorageJSONCompat
+		_ = json.Unmarshal(wrapper.Storage, &compat)
+		if compat.Kind != "" {
+			sj.Kind = compat.Kind
+		}
+	}
+
+	// Build storage.Config for the storage repository.
+	sc := storage.Config{
+		Kind:       sj.Kind,
+		DSN:        sj.DSN,
+		Table:      sj.Table,
+		Columns:    sj.Columns,
+		KeyColumns: sj.KeyColumns,
+		DateColumn: sj.DateColumn,
+	}
+
+	// Build a minimal config.Pipeline carrying only Storage.* for ddl.InferTableDef.
+	var spec config.Pipeline
+	spec.Storage.Kind = sj.Kind
+	spec.Storage.Postgres.DSN = sj.DSN
+	spec.Storage.Postgres.Table = sj.Table
+	spec.Storage.Postgres.Columns = sj.Columns
+	spec.Storage.Postgres.KeyColumns = sj.KeyColumns
+	spec.Storage.Postgres.DateColumn = sj.DateColumn
+	spec.Storage.Postgres.AutoCreateTable = sj.AutoCreateTable
+
+	return sc, spec, nil
 }
 
 func generateReport(rep inspect.DiscoverReport, pretty bool) {
@@ -243,4 +477,29 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// inferColumnsFromConfig builds a deterministic column list from the XML config.
+// It uses all field and list names.
+func inferColumnsFromConfig(cfg xmlparser.Config) []string {
+	cols := make([]string, 0, len(cfg.Fields)+len(cfg.Lists))
+	for name := range cfg.Fields {
+		cols = append(cols, name)
+	}
+	for name := range cfg.Lists {
+		cols = append(cols, name)
+	}
+	sort.Strings(cols)
+	return cols
+}
+
+// recordToRow maps an xmlparser.Record (type Record map[string]any)
+// into a []any in storage column order.
+func recordToRow(rec xmlparser.Record, columns []string) []any {
+	row := make([]any, len(columns))
+	m := map[string]any(rec)
+	for i, col := range columns {
+		row[i] = m[col] // nil if missing
+	}
+	return row
 }
