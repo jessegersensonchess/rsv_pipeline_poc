@@ -34,6 +34,7 @@ import (
 	xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema/ddl"
 	"etl/internal/storage"
+	_ "etl/internal/storage/mssql"    // register "mssql" backend
 	_ "etl/internal/storage/postgres" // register "postgres" backend
 )
 
@@ -309,6 +310,7 @@ func runParserAndLoad(
 			return fmt.Errorf("build ddl: %w", err)
 		}
 		if err := repo.Exec(ctx, ddlSQL); err != nil {
+			log.Printf("execute SQL %v\n", ddlSQL)
 			return fmt.Errorf("apply ddl: %w", err)
 		}
 		log.Printf("ensured table: %s", spec.Storage.Postgres.Table)
