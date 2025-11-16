@@ -81,6 +81,8 @@ func StreamCSVRows(
 ) error {
 	defer src.Close()
 
+	var line int // logical record counter (excluding header, or including—your choice)
+
 	// Options
 	hasHeader := opt.Bool("has_header", true)
 	comma := opt.Rune("comma", ',')
@@ -108,12 +110,14 @@ func StreamCSVRows(
 		colIx[i] = -1
 	}
 
-	line := 0
-	read := func() ([]string, error) { line++; return cr.Read() }
+	// Read header / build mapping.
+	readRec := func() ([]string, error) {
+		line++
+		return cr.Read()
+	}
 
-	// Header
 	if hasHeader {
-		hdr, err := read()
+		hdr, err := readRec()
 		if err != nil {
 			if onErr != nil {
 				onErr(line, fmt.Errorf("read header: %w", err))
@@ -146,11 +150,6 @@ func StreamCSVRows(
 		}
 	}
 
-	// Progress heartbeat
-	const logEveryN = 50_000
-	// lastLog := time.Now()
-	//	rowsSeen := 0
-
 	for {
 		// cooperative cancel
 		select {
@@ -159,10 +158,11 @@ func StreamCSVRows(
 		default:
 		}
 
-		rec, err := read()
+		rec, err := readRec()
 		if err == io.EOF {
 			return nil
 		}
+
 		if err != nil {
 			if onErr != nil {
 				onErr(line, fmt.Errorf("csv read: %w", err))
@@ -171,6 +171,7 @@ func StreamCSVRows(
 		}
 
 		row := transformer.GetRow(len(columns))
+
 		// Fill by TARGET index using dest→source mapping.
 		for t := range columns {
 			si := colIx[t]
@@ -192,11 +193,6 @@ func StreamCSVRows(
 		// Emit
 		select {
 		case out <- row:
-			//			rowsSeen++
-			// if rowsSeen%logEveryN == 0 || time.Since(lastLog) > 5*time.Second {
-			//			if rowsSeen%logEveryN == 0 {
-			//				log.Printf("reader: line=%d emitted=%d", line, rowsSeen)
-			//			}
 		case <-ctx.Done():
 			row.Free()
 			return ctx.Err()

@@ -14,11 +14,24 @@ package transformer
 
 import (
 	"context"
+	"etl/internal/transformer/builtin"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// AnchorRule describes an optional "alignment anchor" used to salvage rows
+// whose column values have shifted due to parse anomalies.
+//
+// If enabled, the transform stage:
+//   - looks for AnchorRule.Value in any column
+//   - if found in a column != AnchorRule.Field,
+//     realigns the row so that the value lands in AnchorRule.Field
+type AnchorRule struct {
+	Field string // name of the target column (e.g. "zarazeni_vozidla")
+	Value string // anchor value (e.g. "RSV")
+}
 
 // CoerceSpec describes how to coerce string fields into typed values.
 // Typical source is the pipeline's "coerce" transform options.
@@ -32,76 +45,126 @@ type CoerceSpec struct {
 	// a broad default set is used (including "ano"/"ne").
 	Truthy []string
 	Falsy  []string
+
+	// Optional alignment anchor. Zero-value means disabled.
+	Anchor *AnchorRule
 }
 
-// TransformLoopRows transforms rows **in place** on pooled *Row objects.
-// It reads pooled rows from 'in', coerces/normalizes fields, and forwards the
-// same *Row to 'out'. Invalid rows are dropped (and returned to pool).
+// TransformLoopRows applies the compiled coercion plan (derived from spec) to
+// each incoming pooled Row and forwards successfully coerced rows to 'out'.
+//
+// Semantics:
+//
+//   - For every row received on 'in', TransformLoopRows attempts to coerce each
+//     column value in-place according to the provided CoerceSpec and the
+//     positional 'columns' slice.
+//   - If coercion for all columns succeeds, the row is sent downstream on 'out'
+//     and ownership transfers to the next stage.
+//   - If coercion fails for any column, the row is dropped (fail-soft), the row
+//     is returned to the pool via r.Free(), and the error is reported through
+//     onReject, if provided.
+//   - The function never returns early on context cancellation. It drains the
+//     'in' channel, freeing each row, to avoid upstream goroutine leaks.
+//
+// Parameters:
+//
+//   - ctx:      cancellation context for the overall pipeline. Cancellation
+//     prevents further forwarding to 'out' but rows are still drained
+//     from 'in' and freed.
+//   - columns:  positional list of column names; len(columns) must match len(r.V).
+//   - in:       upstream channel of pooled rows (typically from the tap stage).
+//   - out:      downstream channel for successfully coerced rows (to validator).
+//   - spec:     high-level coercion specification (types, date layout, etc.).
+//   - onReject: optional callback invoked when a row is dropped due to coercion
+//     failure. It receives the row's logical line number (if known)
+//     and a human-readable reason string.
+//
+// Closing semantics:
+//
+//   - TransformLoopRows does not close 'out'; the caller must close it after all
+//     transform goroutines have completed.
+//   - All rows received from 'in' are eventually freed, regardless of ctx.
 func TransformLoopRows(
 	ctx context.Context,
-	columns []string, // positional target columns
-	in <-chan *Row, // pooled rows with raw strings in V[i] (or nil)
-	out chan<- *Row, // pooled rows with normalized strings/values in V[i]
-	spec CoerceSpec, // coercion rules
+	columns []string,
+	in <-chan *Row,
+	out chan<- *Row,
+	spec CoerceSpec,
+	onReject func(line int, reason string),
 ) {
+	// buildCoercePlan is assumed to be your existing helper that compiles the
+	// high-level CoerceSpec into a hot-path plan with per-column coerce funcs.
+	//	plan := buildCoercePlan(columns, spec)
+
 	plan := compilePlan(columns, spec)
 
 	for r := range in {
-		// If the context is canceled, we MUST NOT return here. Draining the
-		// input prevents upstream senders from blocking indefinitely. We can
-		// skip heavy work under cancellation but we should still Free rows.
-		if ctx.Err() != nil {
-			r.Free()
+		// Even if ctx is canceled, we must *drain and Free*; do not return early.
+		if r == nil || len(r.V) != len(columns) {
+			if r != nil {
+				r.Free()
+			}
 			continue
 		}
 
-		// Defensive: ensure the row width matches the expected columns.
-		if len(r.V) != len(columns) {
+		// If the context has been cancelled, we no longer forward rows
+		// downstream but we still drain and Free them to avoid backpressure.
+		select {
+		case <-ctx.Done():
 			r.Free()
 			continue
+		default:
 		}
 
 		ok := true
+
 		// Hot path: normalize/convert in place, avoiding extra allocations.
 		for i := range columns {
 			raw := r.V[i]
 			if raw == nil {
-				// keep NULL
+				// Keep NULL as-is.
 				continue
 			}
+
 			s, _ := raw.(string) // parser fills strings
-			s = strings.TrimSpace(s)
+			// Normalize edge whitespace only when necessary to save CPU.
+			if builtin.HasEdgeSpace(s) {
+				s = strings.TrimSpace(s)
+			}
+
+			// Empty string becomes NULL.
 			if s == "" {
 				r.V[i] = nil
 				continue
 			}
+
+			if spec.Anchor != nil {
+				applyAnchorRealignment(columns, r, spec.Anchor)
+			}
+
+			// Delegate to the compiled coerce plan for this column. The plan may
+			// parse integers, dates, booleans, etc. in-place into r.V[i].
 			if !plan.cols[i].coerce(&r.V[i], s) {
 				ok = false
+				if onReject != nil {
+					onReject(
+						r.Line,
+						fmt.Sprintf("field %q: cannot coerce %q", columns[i], s),
+					)
+				}
 				break
 			}
 		}
-		if !ok {
-			r.Free() // drop & return to pool
-			continue
-		}
 
-		// Forward to downstream. If cancellation occurs and the downstream
-		// channel is congested, prefer dropping the row (with Free) rather
-		// than blocking and risking a shutdown hang.
-		if ctx.Err() != nil {
+		if !ok {
+			// Row failed coercion; drop it (fail-soft) and return to pool.
 			r.Free()
 			continue
 		}
-		select {
-		case out <- r:
-		default:
-			// Backpressure; if canceled, drop. Otherwise, block and deliver.
-			if ctx.Err() != nil {
-				r.Free()
-				continue
-			}
-			out <- r
-		}
+
+		// Successfully coerced row; forward to the next stage. The downstream
+		// consumer is now responsible for calling r.Free() after persistence.
+		out <- r
 	}
 }
 
@@ -417,4 +480,65 @@ func ValidateSpecSanity(columns []string, spec CoerceSpec) error {
 		}
 	}
 	return nil
+}
+
+// applyAnchorRealignment repositions a known constant "anchor" so that its
+// value appears in the designated column. This repairs common CSV shifts
+// caused by stray delimiters or broken quotes.
+//
+// Behavior:
+//   - If anchor disabled → do nothing
+//   - Find the column index of Anchor.Field
+//   - If row already has anchor.Value in that column → OK
+//   - Otherwise find anchor.Value anywhere else → j
+//   - Shift tail so r.V[j] becomes r.V[targetIdx]
+func applyAnchorRealignment(columns []string, r *Row, ar *AnchorRule) {
+	if r == nil || ar == nil {
+		return
+	}
+
+	// Find anchor field index
+	anchorIdx := -1
+	for i, name := range columns {
+		if name == ar.Field {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 0 {
+		return
+	}
+
+	// Already correctly aligned?
+	if s, ok := r.V[anchorIdx].(string); ok && s == ar.Value {
+		return
+	}
+
+	// Find where the anchor value actually appears
+	valueIdx := -1
+	for i, v := range r.V {
+		if s, ok := v.(string); ok && s == ar.Value {
+			valueIdx = i
+			break
+		}
+	}
+	if valueIdx < 0 || valueIdx == anchorIdx {
+		return
+	}
+
+	// Re-align: shift slice [anchorIdx:] so that valueIdx moves to anchorIdx.
+	newV := make([]any, len(r.V))
+	copy(newV[:anchorIdx], r.V[:anchorIdx])
+
+	shift := valueIdx - anchorIdx
+	for dst := anchorIdx; dst < len(r.V); dst++ {
+		src := dst + shift
+		if src >= anchorIdx && src < len(r.V) {
+			newV[dst] = r.V[src]
+		} else {
+			newV[dst] = nil
+		}
+	}
+
+	r.V = newV
 }

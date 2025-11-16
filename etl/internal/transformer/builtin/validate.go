@@ -51,10 +51,10 @@ type fieldMeta struct {
 // default truthy/falsy sets (lowercased). Includes Czech "ano"/"ne".
 var (
 	defaultTruthy = map[string]struct{}{
-		"1": {}, "t": {}, "true": {}, "yes": {}, "y": {}, "ano": {},
+		"1": {}, "t": {}, "True": {}, "true": {}, "yes": {}, "y": {}, "ano": {},
 	}
 	defaultFalsy = map[string]struct{}{
-		"0": {}, "f": {}, "false": {}, "no": {}, "n": {}, "ne": {},
+		"0": {}, "f": {}, "False": {}, "false": {}, "no": {}, "n": {}, "ne": {},
 	}
 )
 
@@ -66,9 +66,10 @@ func (v *Validate) buildMeta() {
 		}
 		v.meta = make([]fieldMeta, 0, len(v.Contract.Fields))
 		for _, f := range v.Contract.Fields {
+
 			m := fieldMeta{
 				name:     f.Name,
-				kind:     f.Type,
+				kind:     normalizeKind(f.Type),
 				required: f.Required,
 				layout:   f.Layout,
 			}
@@ -102,6 +103,7 @@ func (v *Validate) buildMeta() {
 // Apply validates each record. Valid records are appended to a new slice.
 // Invalid ones are (leniently) dropped, optionally reported via Reject.
 func (v Validate) Apply(in []records.Record) []records.Record {
+	fmt.Println("DEBUG: rejected")
 	v.buildMeta()
 	out := make([]records.Record, 0, len(in))
 	for _, rec := range in {
@@ -301,4 +303,32 @@ func parseAnyDate(s, fieldLayout, globalLayout string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeKind maps schema field types onto the small set of validator kinds.
+//
+// It accepts database-ish types (bigint, int8, integer, boolean, date, etc.)
+// and returns a normalized value used by the hot-path switch in validateRecord.
+//
+// Examples:
+//
+//	"bigint", "int8", "integer" → "int"
+//	"boolean"                    → "bool"
+//	"date", "timestamp"          → "date"
+//	"text", "string"             → "string"
+//	"unknown"                    → "unknown" (lowercased as-is)
+func normalizeKind(t string) string {
+	s := strings.ToLower(t)
+	switch s {
+	case "bigint", "int8", "integer", "int4", "int2", "int":
+		return "int"
+	case "boolean", "bool":
+		return "bool"
+	case "date", "timestamp", "timestamptz":
+		return "date"
+	case "text", "string":
+		return "string"
+	default:
+		return s
+	}
 }
