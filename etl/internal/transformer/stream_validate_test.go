@@ -10,15 +10,20 @@ import (
 /*
 TestValidateLoopRows_AllValid verifies that rows containing all required fields
 are forwarded unchanged and in order, and that no rejects are reported.
+
+It uses an empty type map because ValidateLoopRows currently only enforces
+non-nil / presence checks for required columns; type information is not needed
+for this basic scenario.
 */
 func TestValidateLoopRows_AllValid(t *testing.T) {
 	columns := []string{"id", "name", "age"}
 	required := []string{"id", "name"}
+	types := map[string]string{} // type hints unused in this test
 
 	in := make(chan *Row, 3)
 	out := make(chan *Row, 3)
 
-	// Produce three valid rows.
+	// Produce three valid rows (all required fields present).
 	for i := 0; i < 3; i++ {
 		r := GetRow(len(columns))
 		r.V[0] = "id"
@@ -31,7 +36,7 @@ func TestValidateLoopRows_AllValid(t *testing.T) {
 	var rejects int
 	errcb := func(_ int, _ string) { rejects++ }
 
-	ValidateLoopRows(context.Background(), columns, required, in, out, errcb)
+	ValidateLoopRows(context.Background(), columns, required, types, in, out, errcb)
 
 	if rejects != 0 {
 		t.Fatalf("unexpected rejects: %d", rejects)
@@ -39,6 +44,7 @@ func TestValidateLoopRows_AllValid(t *testing.T) {
 	if got := len(out); got != 3 {
 		t.Fatalf("forwarded %d rows; want 3", got)
 	}
+
 	// Clean up pooled rows.
 	for i := 0; i < 3; i++ {
 		(<-out).Free()
@@ -48,10 +54,18 @@ func TestValidateLoopRows_AllValid(t *testing.T) {
 /*
 TestValidateLoopRows_MissingRequired verifies that rows missing any required
 field are fail-soft dropped, reported via onReject, and not forwarded.
+
+We create three rows:
+  - row 1: valid
+  - row 2: missing "name"
+  - row 3: missing "id"
+
+Only the first row should be forwarded; the other two should be rejected.
 */
 func TestValidateLoopRows_MissingRequired(t *testing.T) {
 	columns := []string{"id", "name"}
 	required := []string{"id", "name"}
+	types := map[string]string{} // type hints unused in this test
 
 	in := make(chan *Row, 3)
 	out := make(chan *Row, 3)
@@ -79,7 +93,7 @@ func TestValidateLoopRows_MissingRequired(t *testing.T) {
 	var rejects int
 	errcb := func(_ int, _ string) { rejects++ }
 
-	ValidateLoopRows(context.Background(), columns, required, in, out, errcb)
+	ValidateLoopRows(context.Background(), columns, required, types, in, out, errcb)
 
 	if rejects != 2 {
 		t.Fatalf("rejects=%d; want 2", rejects)
@@ -92,11 +106,16 @@ func TestValidateLoopRows_MissingRequired(t *testing.T) {
 
 /*
 TestValidateLoopRows_UnknownRequiredColumns verifies that required names not
-present in the columns list are ignored, and valid rows still flow through.
+present in the columns list are ignored. Only actual columns in 'columns'
+should be enforced as required.
+
+We declare required = {"a", "missing", "also_missing"}, but our input columns
+are only {"a", "b"}. A row with non-nil 'a' should pass validation.
 */
 func TestValidateLoopRows_UnknownRequiredColumns(t *testing.T) {
 	columns := []string{"a", "b"}
 	required := []string{"a", "missing", "also_missing"}
+	types := map[string]string{} // type hints unused in this test
 
 	in := make(chan *Row, 1)
 	out := make(chan *Row, 1)
@@ -107,7 +126,7 @@ func TestValidateLoopRows_UnknownRequiredColumns(t *testing.T) {
 	in <- r
 	close(in)
 
-	ValidateLoopRows(context.Background(), columns, required, in, out, nil)
+	ValidateLoopRows(context.Background(), columns, required, types, in, out, nil)
 
 	if got := len(out); got != 1 {
 		t.Fatalf("forwarded=%d; want 1 (unknown required should be ignored)", got)
@@ -118,10 +137,18 @@ func TestValidateLoopRows_UnknownRequiredColumns(t *testing.T) {
 /*
 TestValidateLoopRows_BadRowLenAndNil ensures malformed rows (nil Row or slice
 length mismatch) are drained and freed without panicking and are not forwarded.
+
+We push:
+  - a nil row
+  - a row with length-1 value slice for 2 columns
+  - a correct row
+
+Only the correct row should be forwarded.
 */
 func TestValidateLoopRows_BadRowLenAndNil(t *testing.T) {
 	columns := []string{"c1", "c2"}
 	required := []string{"c1"}
+	types := map[string]string{} // type hints unused in this test
 
 	in := make(chan *Row, 3)
 	out := make(chan *Row, 3)
@@ -142,7 +169,7 @@ func TestValidateLoopRows_BadRowLenAndNil(t *testing.T) {
 
 	close(in)
 
-	ValidateLoopRows(context.Background(), columns, required, in, out, nil)
+	ValidateLoopRows(context.Background(), columns, required, types, in, out, nil)
 
 	if got := len(out); got != 1 {
 		t.Fatalf("forwarded=%d; want 1", got)
@@ -154,10 +181,22 @@ func TestValidateLoopRows_BadRowLenAndNil(t *testing.T) {
 TestValidateLoopRows_CancelStillDrains verifies the "drain-safe" guarantee:
 even when the context is canceled before or during processing, the function
 drains the input channel, frees rejected rows, and forwards valid ones.
+
+We pre-cancel the context, then push 50 rows:
+  - even index rows: valid
+  - odd index rows: invalid (missing required field)
+
+Despite ctx being canceled, ValidateLoopRows must:
+  - still consider each row,
+  - reject 25 invalid rows,
+  - forward 25 valid rows,
+
+before returning.
 */
 func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	columns := []string{"id"}
 	required := []string{"id"}
+	types := map[string]string{} // type hints unused in this test
 
 	ctx, cancel := context.WithCancel(context.Background())
 	in := make(chan *Row, 100)
@@ -170,10 +209,10 @@ func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	for i := 0; i < total; i++ {
 		r := GetRow(1)
 		if i%2 == 0 {
-			// valid
+			// valid: required field present
 			r.V[0] = "ok"
 		} else {
-			// invalid
+			// invalid: required field missing
 			r.V[0] = nil
 		}
 		in <- r
@@ -181,7 +220,7 @@ func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	close(in)
 
 	var rejects int
-	ValidateLoopRows(ctx, columns, required, in, out, func(_ int, _ string) { rejects++ })
+	ValidateLoopRows(ctx, columns, required, types, in, out, func(_ int, _ string) { rejects++ })
 
 	if rejects != total/2 {
 		t.Fatalf("rejects=%d; want %d", rejects, total/2)
@@ -189,6 +228,7 @@ func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	if got := len(out); got != total/2 {
 		t.Fatalf("forwarded=%d; want %d", got, total/2)
 	}
+
 	// Free all forwarded rows.
 	for i := 0; i < total/2; i++ {
 		(<-out).Free()
@@ -197,12 +237,17 @@ func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 
 /*
 TestValidateLoopRows_BlockingOut verifies that ValidateLoopRows will block on
-out when the consumer is slow, and still behaves correctly (forwards valid rows).
-This also implicitly tests that the function does not close 'out' itself.
+the 'out' channel when the consumer is slow, and still behaves correctly
+(forwards valid rows).
+
+We use an unbuffered 'out' channel and a slow consumer that sleeps between
+receives. This also implicitly tests that ValidateLoopRows does not close 'out'
+itself; the caller owns channel closing.
 */
 func TestValidateLoopRows_BlockingOut(t *testing.T) {
 	columns := []string{"a"}
 	required := []string{"a"}
+	types := map[string]string{} // type hints unused in this test
 
 	in := make(chan *Row, 5)
 	out := make(chan *Row) // unbuffered to force blocking
@@ -219,7 +264,7 @@ func TestValidateLoopRows_BlockingOut(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ValidateLoopRows(context.Background(), columns, required, in, out, nil)
+		ValidateLoopRows(context.Background(), columns, required, types, in, out, nil)
 	}()
 
 	// Slow consumer: receive with delays.
@@ -235,9 +280,17 @@ func TestValidateLoopRows_BlockingOut(t *testing.T) {
 	wg.Wait()
 }
 
+/*
+BenchmarkValidateLoopRows_PassAll measures the cost of validating a large number
+of rows when all rows are valid, and no callback is invoked.
+
+We keep the callback nil and ensure that the consumer drains the 'out' channel
+so that ValidateLoopRows is not artificially blocked by channel backpressure.
+*/
 func BenchmarkValidateLoopRows_PassAll(b *testing.B) {
 	columns := []string{"c0", "c1", "c2", "c3", "c4", "c5"}
 	required := []string{"c0", "c3"}
+	types := map[string]string{} // type hints unused in this benchmark
 
 	const N = 50_000
 	makeRows := func() []*Row {
@@ -271,23 +324,33 @@ func BenchmarkValidateLoopRows_PassAll(b *testing.B) {
 			close(done)
 		}()
 
-		ValidateLoopRows(context.Background(), columns, required, in, out, nil)
+		ValidateLoopRows(context.Background(), columns, required, types, in, out, nil)
 		close(out)
 		<-done
 	}
 }
 
+/*
+BenchmarkValidateLoopRows_DropHalf_NoCallback measures performance when roughly
+half the rows are rejected due to missing required fields, with no onReject
+callback installed.
+
+This isolates the cost of the core validation logic (required field checks and
+row dropping) without callback overhead.
+*/
 func BenchmarkValidateLoopRows_DropHalf_NoCallback(b *testing.B) {
 	columns := []string{"c0", "c1", "c2"}
 	required := []string{"c0", "c2"}
+	types := map[string]string{} // type hints unused in this benchmark
 
 	const N = 50_000
 	makeRows := func() []*Row {
 		rows := make([]*Row, N)
 		for i := 0; i < N; i++ {
 			r := GetRow(len(columns))
-			// Alternate valid/invalid by nil'ing a required field.
+			// Required "c0" is always present.
 			r.V[0] = "x"
+			// Alternate valid/invalid by toggling "c2".
 			if i%2 == 0 {
 				r.V[2] = "y" // valid
 			} else {
@@ -307,20 +370,30 @@ func BenchmarkValidateLoopRows_DropHalf_NoCallback(b *testing.B) {
 		}
 		close(in)
 
+		// Drain all forwarded rows.
 		go func() {
 			for r := range out {
 				r.Free()
 			}
 		}()
 
-		ValidateLoopRows(context.Background(), columns, required, in, out, nil)
+		ValidateLoopRows(context.Background(), columns, required, types, in, out, nil)
 		close(out)
 	}
 }
 
+/*
+BenchmarkValidateLoopRows_DropHalf_WithCallback is similar to
+BenchmarkValidateLoopRows_DropHalf_NoCallback, but installs a lightweight
+onReject callback.
+
+This measures the additional overhead of invoking onReject for every rejected
+row (roughly half the input) on top of the core validation logic.
+*/
 func BenchmarkValidateLoopRows_DropHalf_WithCallback(b *testing.B) {
 	columns := []string{"c0", "c1", "c2"}
 	required := []string{"c0", "c2"}
+	types := map[string]string{} // type hints unused in this benchmark
 
 	const N = 50_000
 	makeRows := func() []*Row {
@@ -329,16 +402,19 @@ func BenchmarkValidateLoopRows_DropHalf_WithCallback(b *testing.B) {
 			r := GetRow(len(columns))
 			r.V[0] = "x"
 			if i%2 == 0 {
-				r.V[2] = "y"
+				r.V[2] = "y" // valid
 			} else {
-				r.V[2] = nil
+				r.V[2] = nil // invalid
 			}
 			rows[i] = r
 		}
 		return rows
 	}
 
-	onReject := func(_ int, _ string) { /* intentionally light-weight */ }
+	onReject := func(_ int, _ string) {
+		// Intentionally light-weight to focus on callback dispatch cost rather
+		// than any heavy logging or string formatting.
+	}
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -349,13 +425,14 @@ func BenchmarkValidateLoopRows_DropHalf_WithCallback(b *testing.B) {
 		}
 		close(in)
 
+		// Drain forwarded rows.
 		go func() {
 			for r := range out {
 				r.Free()
 			}
 		}()
 
-		ValidateLoopRows(context.Background(), columns, required, in, out, onReject)
+		ValidateLoopRows(context.Background(), columns, required, types, in, out, onReject)
 		close(out)
 	}
 }

@@ -15,7 +15,9 @@ import "sync"
 //
 // We keep V as []any to feed pgx CopyFromRows directly.
 type Row struct {
-	V []any
+	V    []any
+	Line int // 1-based "logical" line/record number from the source, if known.
+
 }
 
 var rowPool sync.Pool
@@ -33,9 +35,13 @@ func GetRow(colCount int) *Row {
 		for i := range r.V {
 			r.V[i] = nil
 		}
+		r.Line = 0 // reset metadata
 		return r
 	}
-	return &Row{V: make([]any, colCount)}
+	return &Row{
+		V:    make([]any, colCount),
+		Line: 0,
+	}
 }
 
 // Free returns the Row to the pool. The caller must not use r after Free().

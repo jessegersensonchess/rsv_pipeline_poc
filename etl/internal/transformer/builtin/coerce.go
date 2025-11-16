@@ -13,9 +13,9 @@ type Coerce struct {
 
 func (c Coerce) Apply(in []records.Record) []records.Record {
 	for _, r := range in {
-		//if len(c.Types) == 0 {
-		//	return in
-		//}
+		if len(c.Types) == 0 {
+			return in
+		}
 		for field, typ := range c.Types {
 			v, ok := r[field]
 			if !ok || v == nil {
