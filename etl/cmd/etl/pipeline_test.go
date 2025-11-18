@@ -131,6 +131,9 @@ func Test_runLoader_cancelsOnCopyError(t *testing.T) {
 	validCh := make(chan *transformer.Row, 1)
 	errCh := make(chan RowErr, 1)
 
+	// Note: r.V has 2 values while cfg.columns has length 1. This intentionally
+	// exercises the loader's error-path logging to ensure it never panics on
+	// column/value length mismatches and still reports the COPY error on errCh.
 	r := &transformer.Row{V: []any{"x", 1}}
 	validCh <- r
 	close(validCh)
