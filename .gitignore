@@ -2,3 +2,4 @@ configs/pipelines/*.json
 configs/
 testdata
 *.sqlite
+etl.db

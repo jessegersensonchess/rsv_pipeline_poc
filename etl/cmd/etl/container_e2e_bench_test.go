@@ -83,7 +83,7 @@ func BenchmarkRunStreamed_E2E_SQLite(b *testing.B) {
 		Parser: config.Parser{Kind: "csv", Options: config.Options{}},
 		Storage: config.Storage{
 			Kind: "sqlite",
-			Postgres: config.StoragePostgres{
+			DB: config.DBConfig{
 				DSN:             dsn,
 				Table:           table,
 				Columns:         cols,

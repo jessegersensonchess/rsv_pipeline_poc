@@ -24,12 +24,16 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/datasource/file"
+
 	"etl/internal/parser"
 	csvparser "etl/internal/parser/csv"
 	"etl/internal/schema"
-	"etl/internal/schema/ddl"
 	"etl/internal/storage"
-	_ "etl/internal/storage/postgres" // register "postgres" backend
+
+	//_ "etl/internal/storage/mssql"    // register "mssql" backend
+	//_ "etl/internal/storage/postgres" // register "postgres" backend
+	//_ "etl/internal/storage/sqlite"   // register "sqlite" backend
+
 	"etl/internal/transformer"
 	"etl/internal/transformer/builtin"
 )
@@ -124,7 +128,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		"stream runtime: readers=%d transformers=%d loaders=%d batch=%d buffer=%d",
 		rt.readerWorkers, rt.transformers, rt.loaderWorkers, rt.batchSize, rt.bufferSize,
 	)
-	log.Printf("connecting to PostgreSQL with DSN: %s", spec.Storage.Postgres.DSN)
+	log.Printf("connecting to DB with DSN: %s", spec.Storage.DB.DSN)
 
 	repo, err := initRepository(ctx, spec)
 	if err != nil {
@@ -132,11 +136,18 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	}
 	defer repo.Close()
 
-	if spec.Storage.Postgres.AutoCreateTable {
-		if err := ensureTableExists(ctx, repo, spec); err != nil {
-			return err
+	if spec.Storage.DB.AutoCreateTable {
+		if err := storage.EnsureTableFromPipeline(ctx, spec, repo); err != nil {
+			return fmt.Errorf("apply DDL: %w", err)
 		}
 	}
+
+	// depreciated
+	//	if spec.Storage.DB.AutoCreateTable {
+	//		if err := ensureTableExists(ctx, repo, spec); err != nil {
+	//			return err
+	//		}
+	//	}
 
 	// Abstract COPY behind repository for testability.
 	copyFn := func(ctx context.Context, columns []string, rows [][]any) (int64, error) {
@@ -167,7 +178,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	wgErr.Add(1)
 	go func() {
 		defer wgErr.Done()
-		log.Printf("loader: started with batchSize=%d columns=%d", rt.batchSize, len(spec.Storage.Postgres.Columns))
+		log.Printf("loader: started with batchSize=%d columns=%d", rt.batchSize, len(spec.Storage.DB.Columns))
 		for e := range errCh {
 			if e.Err == nil {
 				continue
@@ -204,7 +215,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 			switch spec.Parser.Kind {
 			case "csv":
-				if err := streamCSVRowsFn(ctx, src, spec.Storage.Postgres.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
+				if err := streamCSVRowsFn(ctx, src, spec.Storage.DB.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
 					errCh <- RowErr{Err: err}
 				}
 			default:
@@ -252,7 +263,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		fmt.Println("DEBUG: NO")
 	}
 
-	if err := transformer.ValidateSpecSanity(spec.Storage.Postgres.Columns, coerceSpec); err != nil {
+	if err := transformer.ValidateSpecSanity(spec.Storage.DB.Columns, coerceSpec); err != nil {
 		return fmt.Errorf("coerce spec sanity: %w", err)
 	}
 
@@ -261,7 +272,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 			defer wgTransformers.Done()
 			transformer.TransformLoopRows(
 				ctx,
-				spec.Storage.Postgres.Columns,
+				spec.Storage.DB.Columns,
 				tapRawCh,
 				coercedRowCh,
 				coerceSpec,
@@ -300,7 +311,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 		transformer.ValidateLoopRows(
 			ctx,
-			spec.Storage.Postgres.Columns,
+			spec.Storage.DB.Columns,
 			required,
 			colKinds,
 			coercedRowCh,
@@ -327,7 +338,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		errCh:      errCh,
 		copyFn:     copyFn,
 		batchSize:  rt.batchSize,
-		columns:    spec.Storage.Postgres.Columns,
+		columns:    spec.Storage.DB.Columns,
 		stats:      &stats,
 		clockNowFn: time.Now, // small seam for benchmark tests if needed
 	}
@@ -370,11 +381,11 @@ func newRuntimeConfig(spec config.Pipeline) runtimeConfig {
 func initRepository(ctx context.Context, spec config.Pipeline) (Repository, error) {
 	repo, err := newRepositoryFn(ctx, storage.Config{
 		Kind:       spec.Storage.Kind,
-		DSN:        spec.Storage.Postgres.DSN,
-		Table:      spec.Storage.Postgres.Table,
-		Columns:    spec.Storage.Postgres.Columns,
-		KeyColumns: spec.Storage.Postgres.KeyColumns,
-		DateColumn: spec.Storage.Postgres.DateColumn,
+		DSN:        spec.Storage.DB.DSN,
+		Table:      spec.Storage.DB.Table,
+		Columns:    spec.Storage.DB.Columns,
+		KeyColumns: spec.Storage.DB.KeyColumns,
+		DateColumn: spec.Storage.DB.DateColumn,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("init repo: %w", err)
@@ -388,23 +399,14 @@ func initRepository(ctx context.Context, spec config.Pipeline) (Repository, erro
 // It uses the DDL helper to infer the table definition and generate a CREATE
 // TABLE statement.
 func ensureTableExists(ctx context.Context, repo Repository, spec config.Pipeline) error {
-	log.Printf("auto-create table enabled for %s", spec.Storage.Postgres.Table)
+	log.Printf("auto-create table enabled for %s", spec.Storage.DB.Table)
 
-	td, err := ddl.InferTableDef(spec)
-	if err != nil {
-		return fmt.Errorf("infer table definition: %w", err)
+	if spec.Storage.DB.AutoCreateTable {
+		if err := storage.EnsureTableFromPipeline(ctx, spec, repo); err != nil {
+			return fmt.Errorf("apply DDL: %w", err)
+		}
 	}
-
-	createSQL, err := ddl.BuildCreateTableSQL(td)
-	if err != nil {
-		return fmt.Errorf("build CREATE TABLE statement: %w", err)
-	}
-
-	if err := repo.Exec(ctx, createSQL); err != nil {
-		return fmt.Errorf("apply DDL: %w", err)
-	}
-
-	log.Printf("table ensured: %s", spec.Storage.Postgres.Table)
+	log.Printf("table ensured: %s", spec.Storage.DB.Table)
 	return nil
 }
 

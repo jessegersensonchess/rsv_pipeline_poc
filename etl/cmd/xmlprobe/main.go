@@ -32,10 +32,10 @@ import (
 	"etl/internal/config"
 	"etl/internal/inspect"
 	xmlparser "etl/internal/parser/xml"
-	"etl/internal/schema/ddl"
+
+	_ "etl/internal/storage/all" // register all DB backends
+
 	"etl/internal/storage"
-	_ "etl/internal/storage/mssql"    // register "mssql" backend
-	_ "etl/internal/storage/postgres" // register "postgres" backend
 )
 
 // xmlStorageJSON is the JSON shape for xmlprobe's storage block.
@@ -197,10 +197,10 @@ func main() {
 		if sc.Kind == "" {
 			log.Fatalf("config.storage.kind is required when using -load")
 		}
-		if spec.Storage.Postgres.Table == "" {
+		if spec.Storage.DB.Table == "" {
 			log.Fatalf("config.storage.table is required when using -load")
 		}
-		if len(spec.Storage.Postgres.Columns) == 0 {
+		if len(spec.Storage.DB.Columns) == 0 {
 			log.Fatalf("config.storage.columns must be non-empty when using -load")
 		}
 		storeCfg = &sc
@@ -273,10 +273,12 @@ func runParser(r io.Reader, data []byte, recordTag string, comp xmlparser.Compil
 }
 
 // runParserAndLoad parses XML and bulk-loads into configured storage.
-// It uses the same abstraction level as container.go:
-//   - storage.New(repo)
-//   - ddl.InferTableDef(spec) + BuildCreateTableSQL + repo.Exec (if AutoCreateTable)
-//   - repo.CopyFrom for COPY.
+//
+// It uses the same abstraction level as the main container:
+//   - storage.New(...) to obtain a backend-agnostic Repository.
+//   - storage.EnsureTableFromPipeline(...) to apply backend-specific DDL when
+//     AutoCreateTable is enabled.
+//   - repo.CopyFrom for the actual batched inserts.
 func runParserAndLoad(
 	r io.Reader,
 	data []byte,
@@ -298,22 +300,13 @@ func runParserAndLoad(
 	}
 	defer repo.Close()
 
-	// Optional: create table from config/contract before any write,
-	// using the same pattern as container.go.
-	if spec.Storage.Postgres.AutoCreateTable {
-		td, err := ddl.InferTableDef(*spec)
-		if err != nil {
-			return fmt.Errorf("infer table: %w", err)
-		}
-		ddlSQL, err := ddl.BuildCreateTableSQL(td)
-		if err != nil {
-			return fmt.Errorf("build ddl: %w", err)
-		}
-		if err := repo.Exec(ctx, ddlSQL); err != nil {
-			log.Printf("execute SQL %v\n", ddlSQL)
+	// Optional: create table from config/contract before any write, using the
+	// backend-agnostic DDL bootstrapper registered for the storage kind.
+	if spec.Storage.DB.AutoCreateTable {
+		if err := storage.EnsureTableFromPipeline(ctx, *spec, repo); err != nil {
 			return fmt.Errorf("apply ddl: %w", err)
 		}
-		log.Printf("ensured table: %s", spec.Storage.Postgres.Table)
+		log.Printf("ensured table: %s", spec.Storage.DB.Table)
 	}
 
 	// COPY function remains abstracted behind the repository.
@@ -397,7 +390,8 @@ func readConfig(path string) (xmlparser.Config, error) {
 
 // readStorageConfigAsPipeline pulls the "storage" block from the XML config JSON,
 // maps it both into storage.Config (for storage.New) and a minimal config.Pipeline
-// (for ddl.InferTableDef), using a flat JSON shape. It also tolerates "Kind".
+// (for backend-specific DDL bootstrappers), using a flat JSON shape. It also
+// tolerates "Kind".
 func readStorageConfigAsPipeline(path string) (storage.Config, config.Pipeline, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -425,7 +419,7 @@ func readStorageConfigAsPipeline(path string) (storage.Config, config.Pipeline, 
 		}
 	}
 
-	// Build storage.Config for the storage repository.
+	// Build storage.Config for the storage repository (backend-agnostic).
 	sc := storage.Config{
 		Kind:       sj.Kind,
 		DSN:        sj.DSN,
@@ -435,15 +429,15 @@ func readStorageConfigAsPipeline(path string) (storage.Config, config.Pipeline, 
 		DateColumn: sj.DateColumn,
 	}
 
-	// Build a minimal config.Pipeline carrying only Storage.* for ddl.InferTableDef.
+	// Build a minimal config.Pipeline carrying only Storage.* for DDL inference.
 	var spec config.Pipeline
 	spec.Storage.Kind = sj.Kind
-	spec.Storage.Postgres.DSN = sj.DSN
-	spec.Storage.Postgres.Table = sj.Table
-	spec.Storage.Postgres.Columns = sj.Columns
-	spec.Storage.Postgres.KeyColumns = sj.KeyColumns
-	spec.Storage.Postgres.DateColumn = sj.DateColumn
-	spec.Storage.Postgres.AutoCreateTable = sj.AutoCreateTable
+	spec.Storage.DB.DSN = sj.DSN
+	spec.Storage.DB.Table = sj.Table
+	spec.Storage.DB.Columns = sj.Columns
+	spec.Storage.DB.KeyColumns = sj.KeyColumns
+	spec.Storage.DB.DateColumn = sj.DateColumn
+	spec.Storage.DB.AutoCreateTable = sj.AutoCreateTable
 
 	return sc, spec, nil
 }

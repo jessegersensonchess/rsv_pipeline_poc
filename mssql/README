@@ -1,0 +1,14 @@
+# login 
+docker exec -it mssql bash
+/opt/mssql-tools18/bin/sqlcmd -U app -P 'P@ssw0rd123!' -C
+
+# query
+1> SELECT name FROM sys.databases;
+2> GO
+
+# list users
+SELECT name, type_desc, is_disabled
+FROM sys.sql_logins;
+GO
+
+ALTER LOGIN [user] WITH PASSWORD = 'password';
