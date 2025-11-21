@@ -10,8 +10,13 @@ import (
 	"time" // Add time import
 
 	"etl/internal/config"
+	// register all backends with the stroage factory.
+	// config specifies which to use but we need to build in support for all of them
+	_ "etl/internal/storage/all"
 	// Register the "postgres" backend with the storage factory.
-	_ "etl/internal/storage/postgres"
+	//	_ "etl/internal/storage/postgres"
+	//	_ "etl/internal/storage/mssql"
+	//	_ "etl/internal/storage/sqlite"
 )
 
 // main is the entry point for the ETL binary. It loads the pipeline config,
@@ -62,7 +67,7 @@ func main() {
 	// Print the config information if verbose
 	if *verbose {
 		log.Printf("pipeline: source=%s parser=%s storage=%s table=%s",
-			p.Source.Kind, p.Parser.Kind, p.Storage.Kind, p.Storage.Postgres.Table)
+			p.Source.Kind, p.Parser.Kind, p.Storage.Kind, p.Storage.DB.Table)
 	}
 
 	// Execute the streaming pipeline

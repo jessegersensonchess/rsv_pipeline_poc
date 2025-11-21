@@ -98,11 +98,12 @@ type Storage struct {
 	Kind string `json:"kind"`
 
 	// Postgres carries options for the "postgres" storage kind.
-	Postgres StoragePostgres `json:"postgres"`
+	//Postgres StoragePostgres `json:"postgres"`
+	DB DBConfig `yaml:"db" json:"db"`
 }
 
-// StoragePostgres configures the Postgres sink.
-type StoragePostgres struct {
+// StoragePostgres is now DBConfig, configures the DB sink.
+type DBConfig struct {
 	// DSN is the connection string for pgx/pgxpool (e.g., postgresql://...).
 	DSN string `json:"dsn"`
 

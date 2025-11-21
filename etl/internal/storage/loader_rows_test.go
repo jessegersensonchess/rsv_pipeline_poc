@@ -320,7 +320,7 @@ func TestLoadBatchesRows_Logs(t *testing.T) {
 	defer log.SetOutput(prev)
 
 	var frees int32
-	rows, _ := mkRowLikes(5, &frees)
+	rows, _ := mkRowLikes(500, &frees)
 	in := make(chan *RowLike, len(rows))
 	for _, r := range rows {
 		in <- r

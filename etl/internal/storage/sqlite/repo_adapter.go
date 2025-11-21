@@ -1,18 +1,38 @@
-// Package sqlite registers the SQLite backend with the storage factory.
+// Package sqlite wires the SQLite backend into the storage factory. It exposes
+// a storage.Repository implementation without forcing callers to import this
+// package directly; registration happens in init.
 package sqlite
 
 import (
 	"context"
+	"etl/internal/config"
+	sqliteddl "etl/internal/storage/sqlite/ddl"
+	"fmt"
 
 	"etl/internal/storage"
 )
 
-var newRepository = NewRepository // test hook
+// newRepository is a test hook that points to NewRepository by default.
+// Tests may replace this variable to avoid real DB connections.
+var newRepository = NewRepository
 
+// wrappedRepo adapts *sqlite.Repository to the storage.Repository interface,
+// adding a Close method that calls the cleanup function returned by
+// NewRepository.
 type wrappedRepo struct {
 	*Repository
 	closeFn func()
 }
+
+// Close implements storage.Repository.Close.
+func (w *wrappedRepo) Close() {
+	if w.closeFn != nil {
+		w.closeFn()
+	}
+}
+
+// Ensure wrappedRepo satisfies the interface at compile time.
+var _ storage.Repository = (*wrappedRepo)(nil)
 
 func init() {
 	storage.Register("sqlite", func(ctx context.Context, cfg storage.Config) (storage.Repository, error) {
@@ -27,14 +47,14 @@ func init() {
 		}
 		return &wrappedRepo{Repository: r, closeFn: closeFn}, nil
 	})
-}
 
-func (w *wrappedRepo) Close() { w.closeFn() }
-
-func (w *wrappedRepo) BulkUpsert(ctx context.Context, rows []map[string]any, keyColumns []string, dateColumn string) (int64, error) {
-	return w.Repository.BulkUpsert(ctx, rows, keyColumns, dateColumn)
-}
-
-func (w *wrappedRepo) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
-	return w.Repository.CopyFrom(ctx, columns, rows)
+	// DDL bootstrap registration.
+	storage.RegisterDDL("sqlite",
+		func(ctx context.Context, repo storage.Repository, spec config.Pipeline) error {
+			td, err := sqliteddl.FromPipeline(spec)
+			if err != nil {
+				return fmt.Errorf("infer table definition: %w", err)
+			}
+			return sqliteddl.EnsureTable(ctx, repo, td)
+		})
 }

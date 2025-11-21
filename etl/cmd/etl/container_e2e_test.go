@@ -59,7 +59,7 @@ func buildPipeline(dsn, table string, cols []string, csvPath string, autoCreate 
 		},
 		Storage: config.Storage{
 			Kind: "sqlite",
-			Postgres: config.StoragePostgres{ // shape compatibility
+			DB: config.DBConfig{ // shape compatibility
 				DSN:             dsn,
 				Table:           table,
 				Columns:         cols,
