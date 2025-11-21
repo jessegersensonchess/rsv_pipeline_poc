@@ -1,7 +1,7 @@
 // Command csvprobe samples the first N bytes of a remote CSV file and prints
 // header names with inferred SQL-like types.
 // It prefers HTTP Range requests but also defensively limits reads client-side,
-// so it works even when Range is ignored.
+// so it works even when the server ignores Range.
 //
 // Example:
 //
@@ -12,9 +12,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
-	"fmt"
 	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -24,36 +22,6 @@ import (
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
-
-// fetchFirstBytes retrieves up to n bytes from url using HTTP GET. It sets a
-// "Range: bytes=0-(n-1)" header, but also applies a client-side read limit so
-// it succeeds even when the server ignores Range and returns 200 OK.
-//
-// Returned slice length is <= n.
-func fetchFirstBytes(url string, n int) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if n > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", n-1))
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Regardless of 206 or 200, only read up to n bytes.
-	lr := &io.LimitedReader{R: resp.Body, N: int64(n)}
-	var buf bytes.Buffer
-	_, err = buf.ReadFrom(lr)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
 
 // readCSVSample parses CSV data using delim and returns headers and up to a
 // capped number of data rows. It is tolerant of trimmed samples and malformed lines.
@@ -319,8 +287,9 @@ type jsonContractFieldSpec struct {
 	Falsy    []string `json:"falsy,omitempty"`
 }
 
-// truncateFieldName ensures the field name does not exceed PostgreSQL's 63-character limit,
-// returning the first 10 and last 53 characters if the name exceeds the limit.
+// truncateFieldName ensures the field name does not exceed a Postgres-friendly
+// 63-character identifier limit, returning the first 10 and last 53 characters
+// if the name exceeds the limit.
 func truncateFieldName(s string) string {
 	if len(s) > 63 {
 		return s[:10] + s[len(s)-53:] // First 10 + last 53 characters
@@ -339,12 +308,6 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 	pairs := make([]KV, 0, n)
 	normByHeader := make(map[string]string, n)
 	normalizedCols := make([]string, 0, n)
-	//for _, h := range headers {
-	//	normalized := normalizeFieldName(h)
-	//	normalized = truncateFieldName(normalized)
-	//	pairs = append(pairs, KV{Key: h, Value: normalized})
-	//	normalizedCols = append(normalizedCols, normalized)
-	//}
 
 	for _, h := range headers {
 		norm := normalizeFieldName(h)
@@ -357,8 +320,7 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 	// Detect date/timestamp layouts per column (scoring-based).
 	colLayouts := detectColumnLayouts(rows, inferred)
 
-	// ----- NEW: choose a single "coerce layout" for the dataset -----
-	// We pick a majority layout among all date/timestamp columns; prefer date layouts first.
+	// Choose a single "coerce layout" for the dataset.
 	coerceLayout := chooseMajorityLayout(colLayouts, inferred)
 
 	// Contract fields derived from headers/types.
@@ -390,7 +352,7 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 		fields = append(fields, col)
 	}
 
-	// ----- NEW: build the coerce types map (exclude "text") -----
+	// Build the coerce types map (exclude "text").
 	coerceTypes := make(map[string]string, n)
 	for i, h := range headers {
 		t := contractTypeFromInference(inferred[i])
@@ -405,7 +367,7 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 	cfg.Source.Kind = "file"
 	cfg.Source.File.Path = "testdata/" + normName + ".csv"
 
-	// NEW: runtime defaults (tweak as you wish or plumb via Options)
+	// runtime defaults (tweak as needed).
 	cfg.Runtime = runtimeConfig{
 		ReaderWorkers:    1,
 		TransformWorkers: 1,
@@ -422,32 +384,37 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 	cfg.Parser.Options.ExpectedFields = len(headers)
 	cfg.Parser.Options.HeaderMap = OrderedMap{Pairs: pairs} // preserve CSV order
 
-	// ----- NEW: transform list with "coerce" first, then "validate" -----
-	coerce := transformCoerce{
-		Kind: "coerce",
-		Options: coerceOptions{
-			Layout: coerceLayout,
-			Types:  coerceTypes,
+	// transform list with "coerce" first, then "validate".
+	coerce := map[string]any{
+		"kind": "coerce",
+		"options": map[string]any{
+			"layout": coerceLayout,
+			"types":  coerceTypes,
 		},
 	}
-	validate := transformValidate{
-		Kind: "validate",
-		Options: validateOptions{
-			Policy: "lenient",
+
+	validateContract := map[string]any{
+		"name":   normName,
+		"fields": fields,
+	}
+
+	validate := map[string]any{
+		"kind": "validate",
+		"options": map[string]any{
+			"policy":   "lenient",
+			"contract": validateContract,
 		},
 	}
-	validate.Options.Contract.Name = normName
-	validate.Options.Contract.Fields = fields
 
 	cfg.Transform = []any{coerce, validate}
 
-	// storage
+	// storage: generic storage.db shape with Postgres defaults.
 	cfg.Storage.Kind = "postgres"
-	cfg.Storage.Postgres.DSN = "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable"
-	cfg.Storage.Postgres.Table = "public." + normName
-	cfg.Storage.Postgres.Columns = normalizedCols
-	cfg.Storage.Postgres.KeyColumns = []string{} // keep as-is or set based on your key inference
-	cfg.Storage.Postgres.AutoCreateTable = true  // set per your earlier addition
+	cfg.Storage.DB.DSN = "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable"
+	cfg.Storage.DB.Table = "public." + normName
+	cfg.Storage.DB.Columns = normalizedCols
+	cfg.Storage.DB.KeyColumns = []string{}
+	cfg.Storage.DB.AutoCreateTable = true
 
 	return cfg
 }
@@ -582,7 +549,6 @@ func detectColumnLayouts(rows [][]string, inferred []string) []string {
 }
 
 // dateLayouts are common date formats (no time component).
-// Preferred order isn't critical anymore (scoring is used), but we keep a sensible mix.
 var dateLayouts = []string{
 	"2006-01-02",  // ISO
 	"02.01.2006",  // DMY dot

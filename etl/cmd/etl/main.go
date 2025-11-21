@@ -1,48 +1,29 @@
 package main
 
 import (
-	"context" // Add context import
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"time" // Add time import
+	"time"
 
 	"etl/internal/config"
 	// register all backends with the stroage factory.
 	// config specifies which to use but we need to build in support for all of them
 	_ "etl/internal/storage/all"
-	// Register the "postgres" backend with the storage factory.
-	//	_ "etl/internal/storage/postgres"
-	//	_ "etl/internal/storage/mssql"
-	//	_ "etl/internal/storage/sqlite"
 )
 
 // main is the entry point for the ETL binary. It loads the pipeline config,
 // sets up optional profiling, and executes the streaming pipeline run.
 func main() {
 	var cfgPath string
-	flag.StringVar(&cfgPath, "config", "configs/pipelines/file_to_postgres.json", "pipeline config JSON path")
+	flag.StringVar(&cfgPath, "config", "configs/pipelines/sample.json", "pipeline config JSON path")
 	verbose := flag.Bool("v", false, "enable verbose logs") // default true as requested
 	//	debug := flag.Bool("d", false, "enable debug mode")
 
 	flag.Parse()
-
-	//	if *debug {
-	//		// profiling
-	//		f, _ := os.Create("cpu.pprof")
-	//		pprof.StartCPUProfile(f)
-	//		defer pprof.StopCPUProfile()
-	//
-	//		hf, _ := os.Create("heap.pprof")
-	//		defer func() {
-	//			runtime.GC()
-	//			pprof.WriteHeapProfile(hf)
-	//			hf.Close()
-	//		}()
-	//		// end profiling
-	//	}
 
 	if !*verbose {
 		log.SetOutput(os.Stderr) // still stderr, just less chatter if you gate logs yourself

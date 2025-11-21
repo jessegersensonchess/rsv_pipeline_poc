@@ -3,12 +3,15 @@
 package probe
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"etl/internal/datasource/httpds"
 )
 
 //
@@ -32,9 +35,12 @@ func TestFetchFirstBytes_RangeAndLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := fetchFirstBytes(srv.URL, n)
+	ctx := context.Background()
+	client := httpds.NewClient(httpds.Config{})
+
+	got, err := client.FetchFirstBytes(ctx, srv.URL, n)
 	if err != nil {
-		t.Fatalf("fetchFirstBytes error: %v", err)
+		t.Fatalf("FetchFirstBytes error: %v", err)
 	}
 	if len(got) > n {
 		t.Fatalf("len(got)=%d; want <= %d", len(got), n)
@@ -246,7 +252,7 @@ func TestTruncateFieldName(t *testing.T) {
 //   - header_map preserves CSV order,
 //   - coerce appears before validate,
 //   - only the first integer column with all non-empty samples is marked required,
-//   - storage.postgres.columns are normalized names.
+//   - storage.db.columns are normalized names.
 func TestBuildJSONConfig_StructureAndHeuristics(t *testing.T) {
 	t.Parallel()
 
@@ -273,7 +279,10 @@ func TestBuildJSONConfig_StructureAndHeuristics(t *testing.T) {
 	parser := m["parser"].(map[string]any)
 	opts := parser["options"].(map[string]any)
 	if hmRaw, ok := opts["header_map"]; ok && hmRaw != nil {
-		// Prefer the {pairs:[{key:...,value:...}]} encoding if present.
+		// If header_map is encoded as an object {orig: norm, ...}, we can't
+		// reliably assert order via map iteration, so this block currently
+		// only handles a "pairs" encoding if present. The current
+		// OrderedMap.MarshalJSON emits a flat object, so this check is best-effort.
 		if hmMap, ok := hmRaw.(map[string]any); ok {
 			if pairsRaw, ok := hmMap["pairs"]; ok && pairsRaw != nil {
 				if pairs, ok := pairsRaw.([]any); ok {
@@ -307,12 +316,16 @@ func TestBuildJSONConfig_StructureAndHeuristics(t *testing.T) {
 		t.Fatalf("required fields idx=%v; want [0]", reqIdx)
 	}
 
-	// storage.postgres.columns must be normalized header names.
-	st := m["storage"].(map[string]any)["postgres"].(map[string]any)
-	cols := toStringSlice(st["columns"].([]any))
+	// storage.db.columns must be normalized header names.
+	storage := m["storage"].(map[string]any)
+	if kind, ok := storage["kind"].(string); !ok || kind != "postgres" {
+		t.Fatalf("storage.kind = %v; want %q", storage["kind"], "postgres")
+	}
+	db := storage["db"].(map[string]any)
+	cols := toStringSlice(db["columns"].([]any))
 	wantCols := []string{"id", "age", "name"}
 	if strings.Join(cols, ",") != strings.Join(wantCols, ",") {
-		t.Fatalf("storage.postgres.columns = %v; want %v", cols, wantCols)
+		t.Fatalf("storage.db.columns = %v; want %v", cols, wantCols)
 	}
 }
 
