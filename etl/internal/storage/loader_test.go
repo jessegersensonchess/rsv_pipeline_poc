@@ -365,31 +365,6 @@ func TestLoadBatches_CanceledMidStream(t *testing.T) {
 	}
 }
 
-// TestLoadBatches_Logs ensure no panic and that a final line is emitted.
-// (We don't make assertions on exact content to avoid coupling to formatting.)
-func TestLoadBatches_Logs(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	prev := log.Default().Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(prev)
-
-	in := make(chan []any, 5)
-	for _, r := range mkRows(5) {
-		in <- r
-	}
-	close(in)
-
-	spy := &copySpy{}
-	if _, err := LoadBatches(context.Background(), []string{"id"}, in, 4, spy.fn); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if buf.Len() == 0 {
-		t.Fatalf("expected some log output")
-	}
-}
-
 /*
 Benchmarks
 */

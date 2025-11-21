@@ -260,6 +260,9 @@ func emptyToNil(s string) any {
 // provided) and simple normalization (lowercase, spaces to underscores). It
 // also strips a UTF-8 BOM from the first cell if present.
 func normalizeHeaders(h []string, opt Options) []string {
+	// Strip BOM once up front so all downstream logic sees a clean first header.
+	h = StripHeaderBOM(h)
+
 	res := make([]string, len(h))
 	var c string
 	for i, col := range h {
@@ -268,9 +271,7 @@ func normalizeHeaders(h []string, opt Options) []string {
 		} else {
 			c = col
 		}
-		if i == 0 {
-			c = strings.TrimPrefix(c, utf8BOM)
-		}
+
 		if opt.HeaderMap != nil {
 			if m, ok := opt.HeaderMap[c]; ok {
 				res[i] = m

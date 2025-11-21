@@ -1,38 +1,57 @@
-// Package probe exposes a thin, reusable entrypoint that runs the sample+infer
-// pipeline and returns either CSV summary lines or a JSON config blob suitable
-// for downstream ingestion. It also allows callers to influence the date layout
-// tie-breaker preference used by the scoring detector (EU/DMY vs US/MDY vs Auto).
 package probe
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"unicode/utf8"
+
+	"etl/internal/config"
+	"etl/internal/datasource/httpds"
+	"etl/internal/inspect"
+	xmlparser "etl/internal/parser/xml"
+	"etl/internal/schema"
 )
 
 // Options control the sampling and output behavior.
+//
+// NOTE: This struct is used by both the legacy CSV-only Probe and the new
+// ProbeURL, so new fields must remain optional for existing callers.
 type Options struct {
 	// URL to fetch.
 	URL string
 	// MaxBytes to sample from the start of the file.
 	MaxBytes int
-	// Delimiter (single rune). If zero, default ',' is used.
+	// Delimiter (single rune). If zero, default ',' is used (CSV path only).
 	Delimiter rune
 	// Name used in config/table/file names (normalized later).
 	Name string
 	// OutputJSON toggles JSON config output; otherwise CSV summary is returned.
+	// Used only by the legacy CSV Probe.
 	OutputJSON bool
 	// DatePreference influences tie-breakers for ambiguous numeric dates.
 	// "auto" (default): use built-in preferences (DMY > ISO > MDY).
 	// "eu": bias DMY stronger.
 	// "us": bias MDY stronger.
+	// Used only by the legacy CSV Probe; ProbeURL currently keeps "auto".
 	DatePreference string
-	SaveSample     bool
+	// SaveSample, when true, writes the sampled bytes to a local file
+	// named after Name (normalized). Extension is inferred by ProbeURL,
+	// ".csv" for CSV and ".xml" for XML; legacy Probe always uses ".csv".
+	SaveSample bool
+	// Backend selects the storage backend: "postgres", "mssql", or "sqlite".
+	// Used only by ProbeURL for ETL config generation. Legacy Probe ignores it.
+	Backend string
+	// AllowInsecureTLS, when true, skips TLS certificate verification for HTTP
+	// downloads (useful for self-signed / internal endpoints).
+	AllowInsecureTLS bool
 }
 
 // Result returns the rendered output (either CSV text or JSON text) and
-// also exposes the headers for optional callers.
+// also exposes the headers for optional callers. This is used by the
+// legacy CSV-only Probe.
 type Result struct {
 	// Rendered textual output for display/return (CSV lines or JSON with newline).
 	Body []byte
@@ -42,19 +61,30 @@ type Result struct {
 	Normalized []string
 }
 
+// HTTPPeekFn is the overridable seam used to fetch the first N bytes.
+type HTTPPeekFn func(ctx context.Context, url string, n int, insecure bool) ([]byte, error)
+
+// httpPeekFn is a small overridable seam that the probe package uses to
+// fetch the first N bytes from a URL. In production it is backed by the
+// httpds.Client, but tests can replace it to avoid real HTTP traffic.
+var httpPeekFn HTTPPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]byte, error) {
+	client := httpds.NewClient(httpds.Config{
+		InsecureSkipVerify: insecure,
+	})
+	return client.FetchFirstBytes(ctx, url, n)
+}
+
+// -----------------------------------------------------------------------------
+// Legacy CSV-only probe (kept for cmd/csvparser and tests)
+// -----------------------------------------------------------------------------
+
 // Probe runs the sample+infer pipeline and produces the chosen output.
 //
-// It mirrors your CLI pipeline:
-//   - fetchFirstBytes → cut to last newline
+// It mirrors the original CLI pipeline:
+//   - HTTP FetchFirstBytes (via httpds.Client) → cut to last newline
 //   - readCSVSample   → headers+records (best-effort, skip bad/misaligned rows)
 //   - inferTypes      → per-column types
-//   - (optionally) build + pretty-print JSON config
-//
-// NOTE: this wrapper expects the following functions to exist in your module:
-//
-//	fetchFirstBytes, readCSVSample, inferTypes,
-//	buildJSONConfig, printJSONConfig,
-//	and the scoring helpers including detectColumnLayouts with preferences.
+//   - (optionally) build + pretty-print JSON config (internal jsonConfig shape)
 func Probe(opt Options) (Result, error) {
 	res := Result{}
 
@@ -64,8 +94,10 @@ func Probe(opt Options) (Result, error) {
 		delim = ','
 	}
 
-	// Fetch first N bytes (same as CLI).
-	data, err := fetchFirstBytes(opt.URL, opt.MaxBytes)
+	ctx := context.Background()
+
+	// Fetch first N bytes using the shared HTTP datasource client.
+	data, err := httpPeekFn(ctx, opt.URL, opt.MaxBytes, opt.AllowInsecureTLS)
 	if err != nil {
 		return res, err
 	}
@@ -74,7 +106,7 @@ func Probe(opt Options) (Result, error) {
 		data = data[:i+1]
 	}
 
-	// NEW: write sampled CSV to disk
+	// Optionally write sampled CSV to disk.
 	if opt.SaveSample {
 		fname := normalizeFieldName(opt.Name) + ".csv"
 		if err := writeSampleCSV(fname, data); err != nil {
@@ -82,7 +114,7 @@ func Probe(opt Options) (Result, error) {
 		}
 	}
 
-	// Parse sample.
+	// Parse sample (CSV-only).
 	headers, records, err := readCSVSample(data, delim)
 	if err != nil {
 		return res, err
@@ -92,20 +124,14 @@ func Probe(opt Options) (Result, error) {
 	// Infer types.
 	types := inferTypes(headers, records)
 
-	// Optionally tweak date preference (affects tie-breakers).
-	// If you kept dateLayoutPreference/selectBestLayout in your main package,
-	// they already run as part of buildJSONConfig via detectColumnLayouts.
-	// If you want to override, you can inject here (left as "auto" by default).
+	// DatePreference is currently a no-op; the scoring already prefers DMY.
 	switch opt.DatePreference {
 	case "eu":
-		// Increase weights for DMY; one way is to wrap dateLayoutPreference
-		// with an EU-biased function. For simplicity, the existing preference
-		// already favors DMY; "eu" just keeps the default.
+		// Existing scoring already favors DMY; no additional changes required.
 	case "us":
-		// If you want to bias MDY, you could provide an alt dateLayoutPreferenceUS
-		// and have detectColumnLayouts select it. Kept simple here: Auto is DMY-first.
+		// MDY bias would require alternative dateLayoutPreference; left as-is.
 	default:
-		// "auto" → use current default in detectColumnLayouts (DMY > ISO > MDY).
+		// "auto" → use current default in detectColumnLayouts.
 	}
 
 	// Produce output.
@@ -155,6 +181,7 @@ func DecodeDelimiter(s string) rune {
 }
 
 // OrderedMap preserves insertion order when marshaled as a JSON object.
+// This is used by the legacy JSON config generator (csvprobe-style).
 type OrderedMap struct {
 	Pairs []KV
 }
@@ -163,43 +190,6 @@ type OrderedMap struct {
 type KV struct {
 	Key   string
 	Value string
-}
-
-// runtimeConfig controls ingestion parallelism and buffering.
-type runtimeConfig struct {
-	ReaderWorkers    int `json:"reader_workers"`
-	TransformWorkers int `json:"transform_workers"`
-	LoaderWorkers    int `json:"loader_workers"`
-	BatchSize        int `json:"batch_size"`
-	ChannelBuffer    int `json:"channel_buffer"`
-}
-
-// transformCoerce is a transform that coerces types using a shared layout for dates.
-type transformCoerce struct {
-	Kind    string        `json:"kind"` // "coerce"
-	Options coerceOptions `json:"options"`
-}
-
-type coerceOptions struct {
-	// Layout is the date/timestamp data format used for parsing (e.g., "02.01.2006").
-	// We choose a majority (best) layout across all date/timestamp columns in the sample.
-	Layout string `json:"layout"`
-	// Types maps normalized field names to target types for non-"text" columns.
-	// Example: {"pcv":"int","kod_stk":"int","platnost_od":"date","aktualni":"bool"}
-	Types map[string]string `json:"types"`
-}
-
-type transformValidate struct {
-	Kind    string          `json:"kind"` // "validate"
-	Options validateOptions `json:"options"`
-}
-
-type validateOptions struct {
-	Policy   string `json:"policy"`
-	Contract struct {
-		Name   string                  `json:"name"`
-		Fields []jsonContractFieldSpec `json:"fields"`
-	} `json:"contract"`
 }
 
 // MarshalJSON emits the pairs as a JSON object in the original order.
@@ -224,7 +214,11 @@ func (om OrderedMap) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// jsonConfig models the emitted JSON structure.
+// jsonConfig models the emitted JSON structure for the legacy csvprobe-style
+// config (NOT the ETL config.Pipeline shape).
+//
+// The type itself lives here; buildJSONConfig/printJSONConfig live in
+// internal/probe/main.go and use this type as their return value.
 type jsonConfig struct {
 	Source struct {
 		Kind string `json:"kind"`
@@ -242,31 +236,420 @@ type jsonConfig struct {
 			Comma          string     `json:"comma"`
 			TrimSpace      bool       `json:"trim_space"`
 			ExpectedFields int        `json:"expected_fields"`
-			HeaderMap      OrderedMap `json:"header_map"` // ← ordered
+			HeaderMap      OrderedMap `json:"header_map"`
 		} `json:"options"`
 	} `json:"parser"`
 
 	Transform []any `json:"transform"`
 
-	//Transform []struct {
-	//	Kind    string `json:"kind"`
-	//	Options struct {
-	//		Policy   string `json:"policy"`
-	//		Contract struct {
-	//			Name   string                  `json:"name"`
-	//			Fields []jsonContractFieldSpec `json:"fields"`
-	//		} `json:"contract"`
-	//	} `json:"options"`
-	//} `json:"transform"`
-
 	Storage struct {
-		Kind     string `json:"kind"`
-		Postgres struct {
+		Kind string `json:"kind"`
+		DB   struct {
 			DSN             string   `json:"dsn"`
 			Table           string   `json:"table"`
 			Columns         []string `json:"columns"`
 			KeyColumns      []string `json:"key_columns"`
 			AutoCreateTable bool     `json:"auto_create_table"`
-		} `json:"postgres"`
+		} `json:"db"`
 	} `json:"storage"`
+}
+
+// runtimeConfig controls ingestion parallelism and buffering for the legacy
+// CSV config generator. The ETL runtime config is config.RuntimeConfig.
+type runtimeConfig struct {
+	ReaderWorkers    int `json:"reader_workers"`
+	TransformWorkers int `json:"transform_workers"`
+	LoaderWorkers    int `json:"loader_workers"`
+	BatchSize        int `json:"batch_size"`
+	ChannelBuffer    int `json:"channel_buffer"`
+}
+
+// -----------------------------------------------------------------------------
+// New unified ETL-config probe: ProbeURL (CSV + XML → config.Pipeline)
+// -----------------------------------------------------------------------------
+
+// fileFormat represents a coarse file type inferred from a small sample.
+type fileFormat int
+
+const (
+	formatUnknown fileFormat = iota
+	formatCSV
+	formatXML
+)
+
+// ProbeURL runs the sample+infer pipeline for the given URL and returns a
+// config.Pipeline suitable for cmd/etl. It auto-detects CSV vs XML based on
+// the sampled bytes.
+//
+// The resulting pipeline is intentionally conservative:
+//   - CSV: coerce/validate chain with inferred types and a shared date layout.
+//   - XML: validate contract with type="text" by default, plus a starter XML
+//     parser config; coerce is omitted for now (strings remain as strings).
+func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
+	if opt.MaxBytes <= 0 {
+		opt.MaxBytes = 20000
+	}
+	if opt.Backend == "" {
+		opt.Backend = "postgres"
+	}
+
+	sample, err := httpPeekFn(ctx, opt.URL, opt.MaxBytes, opt.AllowInsecureTLS)
+	if err != nil {
+		return config.Pipeline{}, fmt.Errorf("fetch sample: %w", err)
+	}
+
+	ft := detectFormat(sample)
+	if opt.SaveSample {
+		if err := writeSampleFile(opt.Name, ft, sample); err != nil {
+			return config.Pipeline{}, fmt.Errorf("save sample: %w", err)
+		}
+	}
+
+	switch ft {
+	case formatXML:
+		return probeXML(sample, opt)
+	case formatCSV, formatUnknown:
+		// Unknown: default to CSV; worst case, user edits config manually.
+		return probeCSV(sample, opt)
+	default:
+		return config.Pipeline{}, fmt.Errorf("unhandled format %v", ft)
+	}
+}
+
+// detectFormat applies a very small heuristic on the sampled bytes to decide
+// whether the input looks like XML or CSV. It does not attempt to be perfect;
+// the result is only a hint for initial config generation.
+func detectFormat(sample []byte) fileFormat {
+	s := bytes.TrimSpace(sample)
+	if len(s) == 0 {
+		return formatUnknown
+	}
+	ls := bytes.ToLower(s)
+	if bytes.HasPrefix(ls, []byte("<?xml")) || s[0] == '<' {
+		return formatXML
+	}
+	// If there's an obvious XML tag early on, treat as XML.
+	if bytes.Contains(s[:min(len(s), 256)], []byte("<")) && bytes.Contains(s[:min(len(s), 256)], []byte(">")) {
+		return formatXML
+	}
+	return formatCSV
+}
+
+// writeSampleFile writes the raw sample bytes to a local file with an inferred
+// extension based on the detected format.
+func writeSampleFile(name string, ft fileFormat, data []byte) error {
+	base := normalizeFieldName(name)
+	ext := ".bin"
+	switch ft {
+	case formatCSV:
+		ext = ".csv"
+	case formatXML:
+		ext = ".xml"
+	}
+	return writeSampleCSV(base+ext, data)
+}
+
+// probeCSV builds a config.Pipeline for a CSV source using the existing CSV
+// sampling + type/layout inference heuristics.
+func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
+	// Cut sample at last newline to avoid a half-line record at the end.
+	if i := bytes.LastIndexByte(sample, '\n'); i > 0 {
+		sample = sample[:i+1]
+	}
+
+	// Use the existing CSV sampler: headers + rows as [][]string.
+	headers, rows, err := readCSVSample(sample, ',')
+	if err != nil {
+		return config.Pipeline{}, fmt.Errorf("parse csv sample: %w", err)
+	}
+
+	types := inferTypes(headers, rows)
+	colLayouts := detectColumnLayouts(rows, types)
+	coerceLayout := chooseMajorityLayout(colLayouts, types)
+
+	// Build contract fields and normalized column names.
+	fields := make([]schema.Field, 0, len(headers))
+	normalizedCols := make([]string, 0, len(headers))
+	normByHeader := make(map[string]string, len(headers))
+
+	for _, h := range headers {
+		n := truncateFieldName(normalizeFieldName(h))
+		normByHeader[h] = n
+		normalizedCols = append(normalizedCols, n)
+	}
+
+	requiredCounter := 0
+	for i, h := range headers {
+		ct := contractTypeFromInference(types[i])
+		f := schema.Field{
+			Name:     normByHeader[h],
+			Type:     ct,
+			Required: false,
+		}
+
+		// Heuristic: first integer column with no empties is required.
+		if types[i] == "integer" && allNonEmptySample(rows, i) && requiredCounter == 0 {
+			f.Required = true
+			requiredCounter++
+		}
+
+		// Layout for date/timestamp columns.
+		if types[i] == "date" || types[i] == "timestamp" {
+			if lay := colLayouts[i]; lay != "" {
+				f.Layout = lay
+			}
+		}
+
+		// Truthy/falsy for booleans.
+		if types[i] == "boolean" {
+			f.Truthy = []string{"1", "t", "true", "yes", "y"}
+			f.Falsy = []string{"0", "f", "false", "no", "n"}
+		}
+
+		fields = append(fields, f)
+	}
+
+	// Build coerce types map (skip explicit text).
+	coerceTypes := make(map[string]string, len(headers))
+	for i, h := range headers {
+		t := contractTypeFromInference(types[i])
+		if t != "text" {
+			coerceTypes[normByHeader[h]] = t
+		}
+	}
+
+	// Build pipeline.
+	var p config.Pipeline
+
+	// Source: suggest a local file path; user will edit as needed.
+	p.Source.Kind = "file"
+	p.Source.File.Path = normalizeFieldName(opt.Name) + ".csv"
+
+	// Runtime: conservative defaults; user may tune later.
+	p.Runtime = config.RuntimeConfig{
+		ReaderWorkers:    1,
+		TransformWorkers: 1,
+		LoaderWorkers:    1,
+		BatchSize:        5000,
+		ChannelBuffer:    1000,
+	}
+
+	// Parser config.
+	p.Parser.Kind = "csv"
+	p.Parser.Options = config.Options{
+		"has_header":      true,
+		"comma":           ",",
+		"trim_space":      true,
+		"expected_fields": len(headers),
+		"header_map":      buildHeaderMap(headers, normByHeader),
+	}
+
+	// Transform chain: coerce then validate.
+	coerceOpt := config.Options{
+		"layout": coerceLayout,
+		"types":  coerceTypes,
+	}
+	coerce := config.Transform{
+		Kind:    "coerce",
+		Options: coerceOpt,
+	}
+
+	contract := schema.Contract{
+		Name:   normalizeFieldName(opt.Name),
+		Fields: fields,
+	}
+	validateOpt := config.Options{
+		"policy":   "lenient",
+		"contract": contract,
+	}
+	validate := config.Transform{
+		Kind:    "validate",
+		Options: validateOpt,
+	}
+	p.Transform = []config.Transform{coerce, validate}
+
+	// Storage: backend-specific defaults.
+	backend := normalizeBackendKind(opt.Backend)
+	p.Storage.Kind = backend
+	p.Storage.DB = defaultDBConfigForBackend(backend, opt.Name, normalizedCols)
+
+	return p, nil
+}
+
+// probeXML builds a config.Pipeline for an XML source. It uses discovery to
+// build an xmlparser.Config and infers the columns from fields+lists. Types
+// default to "text" and can be hand-edited later.
+func probeXML(sample []byte, opt Options) (config.Pipeline, error) {
+	// Guess record tag via discovery on the sample.
+	rt, err := inspect.GuessRecordTag(bytes.NewReader(sample))
+	if err != nil {
+		return config.Pipeline{}, fmt.Errorf("guess record tag: %w", err)
+	}
+	if rt == "" {
+		return config.Pipeline{}, fmt.Errorf("guess record tag: empty result")
+	}
+
+	// Discover structure using the same record tag.
+	rep, err := inspect.Discover(bytes.NewReader(sample), rt)
+	if err != nil {
+		return config.Pipeline{}, fmt.Errorf("discover xml structure: %w", err)
+	}
+
+	// Starter XML parser config.
+	xmlCfg := inspect.StarterConfigFrom(rep)
+	xmlCfg.RecordTag = rt
+
+	// Build a deterministic column list from fields + lists.
+	cols := inferColumnsFromConfig(xmlCfg)
+
+	// Build contract fields: all text, optional (user can refine).
+	fields := make([]schema.Field, 0, len(cols))
+	for _, name := range cols {
+		fields = append(fields, schema.Field{
+			Name: name,
+			Type: "text",
+		})
+	}
+
+	// Build pipeline.
+	var p config.Pipeline
+
+	p.Source.Kind = "file"
+	p.Source.File.Path = normalizeFieldName(opt.Name) + ".xml"
+
+	p.Runtime = config.RuntimeConfig{
+		ReaderWorkers:    1,
+		TransformWorkers: 1,
+		LoaderWorkers:    1,
+		BatchSize:        5000,
+		ChannelBuffer:    1000,
+	}
+
+	p.Parser.Kind = "xml"
+
+	// Embed the XML parser config as a nested object inside parser.options.
+	var xmlOpt map[string]any
+	{
+		b, err := xmlparser.MarshalConfigJSON(xmlCfg, false)
+		if err != nil {
+			return config.Pipeline{}, fmt.Errorf("marshal xml config: %w", err)
+		}
+		if err := json.Unmarshal(b, &xmlOpt); err != nil {
+			return config.Pipeline{}, fmt.Errorf("unmarshal xml config: %w", err)
+		}
+	}
+	p.Parser.Options = config.Options{
+		"xml_config": xmlOpt,
+	}
+
+	contract := schema.Contract{
+		Name:   normalizeFieldName(opt.Name),
+		Fields: fields,
+	}
+	validateOpt := config.Options{
+		"policy":   "lenient",
+		"contract": contract,
+	}
+	p.Transform = []config.Transform{
+		{
+			Kind:    "validate",
+			Options: validateOpt,
+		},
+	}
+
+	backend := normalizeBackendKind(opt.Backend)
+	p.Storage.Kind = backend
+	p.Storage.DB = defaultDBConfigForBackend(backend, opt.Name, cols)
+
+	return p, nil
+}
+
+// inferColumnsFromConfig builds a deterministic column list from the XML
+// parser config. It combines field and list names and sorts them.
+func inferColumnsFromConfig(cfg xmlparser.Config) []string {
+	cols := make([]string, 0, len(cfg.Fields)+len(cfg.Lists))
+	for name := range cfg.Fields {
+		cols = append(cols, name)
+	}
+	for name := range cfg.Lists {
+		cols = append(cols, name)
+	}
+	// deterministic order for config diffs
+	if len(cols) > 1 {
+		for i := 0; i < len(cols)-1; i++ {
+			for j := i + 1; j < len(cols); j++ {
+				if cols[j] < cols[i] {
+					cols[i], cols[j] = cols[j], cols[i]
+				}
+			}
+		}
+	}
+	return cols
+}
+
+// buildHeaderMap constructs the parser.options.header_map object from the
+// original CSV headers and their normalized names.
+func buildHeaderMap(headers []string, normByHeader map[string]string) map[string]string {
+	out := make(map[string]string, len(headers))
+	for _, h := range headers {
+		out[h] = normByHeader[h]
+	}
+	return out
+}
+
+// normalizeBackendKind normalizes user-provided backend names.
+func normalizeBackendKind(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "postgres", "postgresql":
+		return "postgres"
+	case "mssql", "sqlserver":
+		return "mssql"
+	case "sqlite":
+		return "sqlite"
+	default:
+		return "postgres"
+	}
+}
+
+// defaultDBConfigForBackend builds a DBConfig with backend-specific defaults.
+// DSNs are placeholders that users are expected to edit.
+func defaultDBConfigForBackend(backend, name string, columns []string) config.DBConfig {
+	tableBase := normalizeFieldName(name)
+	switch backend {
+	case "mssql":
+		return config.DBConfig{
+			DSN:             "sqlserver://user:password@0.0.0.0:1433?database=testdb",
+			Table:           "dbo." + tableBase,
+			Columns:         columns,
+			KeyColumns:      []string{},
+			DateColumn:      "",
+			AutoCreateTable: true,
+		}
+	case "sqlite":
+		return config.DBConfig{
+			DSN:             "file:etl.db?cache=shared&_fk=1",
+			Table:           tableBase,
+			Columns:         columns,
+			KeyColumns:      []string{},
+			DateColumn:      "",
+			AutoCreateTable: true,
+		}
+	default: // postgres
+		return config.DBConfig{
+			DSN:             "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+			Table:           "public." + tableBase,
+			Columns:         columns,
+			KeyColumns:      []string{},
+			DateColumn:      "",
+			AutoCreateTable: true,
+		}
+	}
+}
+
+// min returns the smaller of a and b.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -25,14 +25,11 @@ import (
 	"etl/internal/config"
 	"etl/internal/datasource/file"
 
-	"etl/internal/parser"
 	csvparser "etl/internal/parser/csv"
+	xmlparser "etl/internal/parser/xml"
+
 	"etl/internal/schema"
 	"etl/internal/storage"
-
-	//_ "etl/internal/storage/mssql"    // register "mssql" backend
-	//_ "etl/internal/storage/postgres" // register "postgres" backend
-	//_ "etl/internal/storage/sqlite"   // register "sqlite" backend
 
 	"etl/internal/transformer"
 	"etl/internal/transformer/builtin"
@@ -93,6 +90,10 @@ var (
 	openSourceFn = openSource
 
 	streamCSVRowsFn = csvparser.StreamCSVRows
+
+	// streamXMLRowsFn provides a test seam for the XML streaming adapter.
+	// In production it points to xmlparser.StreamXMLRows.
+	streamXMLRowsFn = xmlparser.StreamXMLRows
 )
 
 // runStreamed executes a full CSV/XML → coerce → validate → storage pipeline
@@ -141,13 +142,6 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 			return fmt.Errorf("apply DDL: %w", err)
 		}
 	}
-
-	// depreciated
-	//	if spec.Storage.DB.AutoCreateTable {
-	//		if err := ensureTableExists(ctx, repo, spec); err != nil {
-	//			return err
-	//		}
-	//	}
 
 	// Abstract COPY behind repository for testability.
 	copyFn := func(ctx context.Context, columns []string, rows [][]any) (int64, error) {
@@ -215,7 +209,29 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 			switch spec.Parser.Kind {
 			case "csv":
-				if err := streamCSVRowsFn(ctx, src, spec.Storage.DB.Columns, spec.Parser.Options, rawRowCh, onParseErr); err != nil {
+				if err := streamCSVRowsFn(
+					ctx,
+					src,
+					spec.Storage.DB.Columns,
+					spec.Parser.Options,
+					rawRowCh,
+					onParseErr,
+				); err != nil {
+					errCh <- RowErr{Err: err}
+				}
+
+			case "xml":
+				// XML streaming path: uses internal/parser/xml.StreamXMLRows, which
+				// consumes parser.options as an xml.Config JSON and emits *transformer.Row
+				// records aligned with storage.DB.Columns.
+				if err := streamXMLRowsFn(
+					ctx,
+					src,
+					spec.Storage.DB.Columns,
+					spec.Parser.Options,
+					rawRowCh,
+					onParseErr,
+				); err != nil {
 					errCh <- RowErr{Err: err}
 				}
 			default:
@@ -656,22 +672,22 @@ func openSource(ctx context.Context, spec config.Pipeline) (io.ReadCloser, error
 }
 
 // buildParser maps parser configuration into a concrete parser implementation.
-func buildParser(p config.Parser) (parser.Parser, error) {
-	switch p.Kind {
-	case "csv":
-		opt := csvparser.Options{
-			HasHeader:            p.Options.Bool("has_header", true),
-			Comma:                p.Options.Rune("comma", ','),
-			TrimSpace:            p.Options.Bool("trim_space", true),
-			ExpectedFields:       p.Options.Int("expected_fields", 0),
-			HeaderMap:            p.Options.StringMap("header_map"),
-			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
-		}
-		return csvparser.NewParser(opt), nil
-	default:
-		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
-	}
-}
+//func buildParser(p config.Parser) (parser.Parser, error) {
+//	switch p.Kind {
+//	case "csv":
+//		opt := csvparser.Options{
+//			HasHeader:            p.Options.Bool("has_header", true),
+//			Comma:                p.Options.Rune("comma", ','),
+//			TrimSpace:            p.Options.Bool("trim_space", true),
+//			ExpectedFields:       p.Options.Int("expected_fields", 0),
+//			HeaderMap:            p.Options.StringMap("header_map"),
+//			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
+//		}
+//		return csvparser.NewParser(opt), nil
+//	default:
+//		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
+//	}
+//}
 
 // normalizedKindsFromSpec returns a mapping of column name -> normalized kind
 // for the streaming validator.

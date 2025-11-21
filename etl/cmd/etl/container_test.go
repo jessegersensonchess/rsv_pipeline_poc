@@ -86,7 +86,6 @@ Unit tests for the small, pure helpers and thin adapters in container.go.
 
 We cover:
   - openSource: file path happy path + unsupported kind
-  - buildParser: csv + unsupported kind
   - getenvInt / pickInt: env parsing and defaulting
   - splitFQN: robust splitting with empty segments elided
   - coerceTypesFromSpec / coerceLayoutFromSpec: default behavior with no transforms
@@ -153,18 +152,6 @@ func TestOpenSource_FileAndUnsupported(t *testing.T) {
 				t.Fatalf("body mismatch: got %q want %q", string(b), c.wantBody)
 			}
 		})
-	}
-}
-
-func TestBuildParser_CSVAndUnsupported(t *testing.T) {
-	// CSV path should construct without error using defaulted options.
-	if _, err := buildParser(config.Parser{Kind: "csv"}); err != nil {
-		t.Fatalf("buildParser(csv): %v", err)
-	}
-
-	// Unsupported kind should error.
-	if _, err := buildParser(config.Parser{Kind: "json"}); err == nil {
-		t.Fatalf("buildParser(json) expected error, got nil")
 	}
 }
 
