@@ -1,0 +1,104 @@
+// Package metrics provides a small, backend-agnostic abstraction for recording
+// operational metrics from the ETL pipeline.
+//
+// The package is intentionally minimal and opinionated:
+//
+//   - It exposes a narrow interface (Backend) focused on counters and timing
+//     data (histograms).
+//   - It provides a global, pluggable backend that defaults to a no-op
+//     implementation, so metrics are always safe to call even when no real
+//     backend is configured.
+//   - It is designed to mirror the storage abstraction pattern used elsewhere
+//     in the project (e.g. storage.Repository), allowing the rest of the codebase
+//     to depend only on this interface while keeping concrete metric systems
+//     isolated in subpackages.
+//
+// The primary use case is instrumentation of the ETL pipeline stages
+// (reader, transformer, validator, loader, etc.) without coupling the core
+// application logic to a specific metrics system such as Prometheus or Datadog.
+package metrics
+
+import "time"
+
+// Labels are string key/value pairs attached to a metric.
+type Labels map[string]string
+
+// Backend is the minimal interface for metrics backends.
+// It is intentionally generic so we can plug in Prometheus, Datadog, etc.
+type Backend interface {
+	// IncCounter increments a counter by delta.
+	IncCounter(name string, delta float64, labels Labels)
+	// ObserveHistogram records a value in a latency/duration style metric.
+	ObserveHistogram(name string, value float64, labels Labels)
+	// Flush pushes or flushes metrics, if the backend needs it (e.g. Pushgateway).
+	Flush() error
+}
+
+// nopBackend is used by default so metrics are optional.
+type nopBackend struct{}
+
+func (nopBackend) IncCounter(name string, delta float64, labels Labels)       {}
+func (nopBackend) ObserveHistogram(name string, value float64, labels Labels) {}
+func (nopBackend) Flush() error                                               { return nil }
+
+var backend Backend = nopBackend{}
+
+// SetBackend installs a concrete backend. Passing nil keeps the existing backend.
+func SetBackend(b Backend) {
+	if b == nil {
+		return
+	}
+	backend = b
+}
+
+// Flush delegates to the current backend.
+func Flush() error {
+	return backend.Flush()
+}
+
+// RecordStep is a convenience for the common pattern:
+// measure latency + success/failure per ETL step.
+func RecordStep(job, step string, err error, d time.Duration) {
+	status := "success"
+	if err != nil {
+		status = "failure"
+	}
+
+	lbls := Labels{
+		"job":    job,
+		"step":   step,
+		"status": status,
+	}
+
+	backend.IncCounter("etl_step_total", 1, lbls)
+	backend.ObserveHistogram("etl_step_duration_seconds", d.Seconds(), lbls)
+}
+
+// RecordRow increments a record-level counter for the given job and kind.
+//
+// Typical kinds mirror the ETL summary fields, e.g.:
+//   - "processed"
+//   - "parse_errors"
+//   - "validate_dropped"
+//   - "transform_rejected"
+//   - "transform_dropped"
+//   - "inserted"
+func RecordRow(job, kind string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	backend.IncCounter("etl_records_total", float64(delta), Labels{
+		"job":  job,
+		"kind": kind,
+	})
+}
+
+// RecordBatches increments a batch-level counter for the given job.
+func RecordBatches(job string, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	backend.IncCounter("etl_batches_total", float64(delta), Labels{
+		"job": job,
+	})
+}

@@ -306,10 +306,8 @@ func runStreamed(ctx context.Context, spec config.Pipeline) (err error) {
 
 	// Attach anchor salvage rule if configured
 	if ar := anchorRuleFromSpec(spec); ar != nil {
-		fmt.Println("DEBUG: YES")
+		log.Printf("DEBUG: YES")
 		coerceSpec.Anchor = ar
-	} else {
-		fmt.Println("DEBUG: NO")
 	}
 
 	if err := transformer.ValidateSpecSanity(spec.Storage.DB.Columns, coerceSpec); err != nil {

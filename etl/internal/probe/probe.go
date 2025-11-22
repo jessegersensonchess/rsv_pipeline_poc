@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 
 	"etl/internal/config"
+	"etl/internal/datasource/file"
 	"etl/internal/datasource/httpds"
 	"etl/internal/inspect"
 	xmlparser "etl/internal/parser/xml"
@@ -47,6 +49,10 @@ type Options struct {
 	// AllowInsecureTLS, when true, skips TLS certificate verification for HTTP
 	// downloads (useful for self-signed / internal endpoints).
 	AllowInsecureTLS bool
+
+	// Job is the logical job name for metrics/config.
+	// Defaults to normalized Name when empty.
+	Job string
 }
 
 // Result returns the rendered output (either CSV text or JSON text) and
@@ -67,7 +73,42 @@ type HTTPPeekFn func(ctx context.Context, url string, n int, insecure bool) ([]b
 // httpPeekFn is a small overridable seam that the probe package uses to
 // fetch the first N bytes from a URL. In production it is backed by the
 // httpds.Client, but tests can replace it to avoid real HTTP traffic.
-var httpPeekFn HTTPPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]byte, error) {
+//var httpPeekFn HTTPPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]byte, error) {
+//	client := httpds.NewClient(httpds.Config{
+//		InsecureSkipVerify: insecure,
+//	})
+//	return client.FetchFirstBytes(ctx, url, n)
+//}
+
+// httpPeekFn is a small overridable seam that the probe package uses to
+// fetch the first N bytes from a URL. In production it is backed by the
+// httpds.Client for HTTP/HTTPS URLs, and file.NewLocal for file:// URLs.
+// Tests can replace it to avoid real I/O.
+var httpPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]byte, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("peek: n must be > 0")
+	}
+
+	// Local filesystem: file://path/to/file
+	if strings.HasPrefix(url, "file://") {
+		path := strings.TrimPrefix(url, "file://")
+
+		src := file.NewLocal(path)
+		rc, err := src.Open(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+
+		lr := &io.LimitedReader{R: rc, N: int64(n)}
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, lr); err != nil && err != io.EOF {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
+	// HTTP(S) path: use httpds client.
 	client := httpds.NewClient(httpds.Config{
 		InsecureSkipVerify: insecure,
 	})
@@ -293,6 +334,16 @@ func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
 		opt.Backend = "postgres"
 	}
 
+	// set a default job name
+	job := opt.Job
+	if job == "" {
+		if opt.Name != "" {
+			job = normalizeFieldName(opt.Name)
+		} else {
+			job = "etl_job"
+		}
+	}
+
 	sample, err := httpPeekFn(ctx, opt.URL, opt.MaxBytes, opt.AllowInsecureTLS)
 	if err != nil {
 		return config.Pipeline{}, fmt.Errorf("fetch sample: %w", err)
@@ -305,15 +356,37 @@ func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
 		}
 	}
 
+	//	switch ft {
+	//	case formatXML:
+	//		return probeXML(sample, opt)
+	//	case formatCSV, formatUnknown:
+	//		// Unknown: default to CSV; worst case, user edits config manually.
+	//		return probeCSV(sample, opt)
+	//	default:
+	//		return config.Pipeline{}, fmt.Errorf("unhandled format %v", ft)
+	//	}
+	//
+	var p config.Pipeline
+
 	switch ft {
 	case formatXML:
-		return probeXML(sample, opt)
+		p, err = probeXML(sample, opt)
 	case formatCSV, formatUnknown:
 		// Unknown: default to CSV; worst case, user edits config manually.
-		return probeCSV(sample, opt)
+		p, err = probeCSV(sample, opt)
 	default:
 		return config.Pipeline{}, fmt.Errorf("unhandled format %v", ft)
 	}
+	if err != nil {
+		return config.Pipeline{}, err
+	}
+
+	// Ensure Job is set on the resulting pipeline.
+	if p.Job == "" {
+		p.Job = job
+	}
+
+	return p, nil
 }
 
 // detectFormat applies a very small heuristic on the sampled bytes to decide
@@ -430,7 +503,7 @@ func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
 		ReaderWorkers:    1,
 		TransformWorkers: 1,
 		LoaderWorkers:    1,
-		BatchSize:        5000,
+		BatchSize:        1,
 		ChannelBuffer:    1000,
 	}
 
