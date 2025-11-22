@@ -24,6 +24,7 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/datasource/file"
+	"etl/internal/metrics"
 	"etl/internal/parser"
 
 	csvparser "etl/internal/parser/csv"
@@ -51,6 +52,7 @@ const (
 // All fields are updated atomically; use the helper methods when possible
 // instead of manipulating counters directly.
 type counters struct {
+	job              string       // metrics label; set once per run
 	processed        atomic.Int64 // rows entering the coerce stage
 	parseErrors      atomic.Int64 // rows that failed parsing (CSV/XML)
 	validateRejects  atomic.Int64 // rows rejected by validation
@@ -123,7 +125,12 @@ var (
 // Back-pressure is enforced via bounded channels so that peak memory stays
 // around O(batchSize + bufferSize). A fatal loader error cancels the context
 // and drains/frees remaining rows to avoid leaks or deadlocks.
-func runStreamed(ctx context.Context, spec config.Pipeline) error {
+func runStreamed(ctx context.Context, spec config.Pipeline) (err error) {
+	start := time.Now()
+	defer func() {
+		metrics.RecordStep(spec.Job, "run_streamed", err, time.Since(start))
+	}()
+
 	rt := newRuntimeConfig(spec)
 
 	log.Printf(
@@ -132,15 +139,17 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	)
 	log.Printf("connecting to DB with DSN: %s", spec.Storage.DB.DSN)
 
-	repo, err := initRepository(ctx, spec)
-	if err != nil {
+	repo, repoErr := initRepository(ctx, spec)
+	if repoErr != nil {
+		err = repoErr
 		return err
 	}
 	defer repo.Close()
 
 	if spec.Storage.DB.AutoCreateTable {
 		if err := storage.EnsureTableFromPipeline(ctx, spec, repo); err != nil {
-			return fmt.Errorf("apply DDL: %w", err)
+			err = fmt.Errorf("apply DDL: %w", err)
+			return err
 		}
 	}
 
@@ -154,7 +163,8 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	defer cancel()
 
 	// Shared stats and error aggregators.
-	var stats counters
+	// var stats counters
+	stats := counters{job: spec.Job}
 
 	parseAgg := newErrAgg(thisMany)     // aggregated parse errors (first N messages)
 	transformAgg := newErrAgg(thisMany) // aggregated transform/coerce errors (first N messages)
@@ -192,18 +202,27 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 	for i := 0; i < rt.readerWorkers; i++ {
 		go func() {
-			defer wgReaders.Done()
+			var stageErr error
+			startReader := time.Now()
+			defer func() {
+				metrics.RecordStep(spec.Job, "reader", stageErr, time.Since(startReader))
+				wgReaders.Done()
+			}()
 
 			onParseErr := func(_ int, err error) {
 				if err == nil {
 					return
 				}
 				parseAgg.add(err.Error())
-				stats.parseErrors.Add(1)
-			}
+				stats.IncParseError()
 
+				//				stats.parseErrors.Add(1)
+				//				metrics.RecordRow(spec.Job, "parse_errors", 1)
+
+			}
 			src, err := openSourceFn(ctx, spec)
 			if err != nil {
+				stageErr = fmt.Errorf("source open: %w", err)
 				errCh <- RowErr{Err: fmt.Errorf("source open: %w", err)}
 				return
 			}
@@ -260,7 +279,9 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 		defer close(tapRawCh)
 
 		for r := range rawRowCh {
-			stats.processed.Add(1)
+			//			stats.processed.Add(1)
+			//			metrics.RecordRow(spec.Job, "processed", 1)
+			stats.IncProcessed()
 
 			select {
 			case tapRawCh <- r:
@@ -297,6 +318,12 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 
 	for i := 0; i < rt.transformers; i++ {
 		go func() {
+			var stageErr error
+			startTransformer := time.Now()
+			defer func() {
+				metrics.RecordStep(spec.Job, "transformers", stageErr, time.Since(startTransformer))
+			}()
+
 			defer wgTransformers.Done()
 			transformer.TransformLoopRows(
 				ctx,
@@ -311,7 +338,9 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 					} else {
 						transformAgg.add(fmt.Sprintf("reason: %v, i=%v", reason, i))
 					}
-					stats.transformRejects.Add(1)
+					stats.IncTransformRejected()
+					// stats.transformRejects.Add(1)
+					// metrics.RecordRow(spec.Job, "transform_rejects", 1)
 				},
 			)
 		}()
@@ -334,6 +363,12 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	var wgValidator sync.WaitGroup
 	wgValidator.Add(1)
 	go func() {
+		var stageErr error
+		startValidator := time.Now()
+		defer func() {
+			metrics.RecordStep(spec.Job, "validator", stageErr, time.Since(startValidator))
+		}()
+
 		defer wgValidator.Done()
 		defer close(validCh)
 
@@ -350,12 +385,17 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				} else {
 					validateAgg.add(reason)
 				}
-				stats.validateRejects.Add(1)
+				stats.IncValidateDropped()
+
+				//				stats.validateRejects.Add(1)
+				//				metrics.RecordRow(spec.Job, "validate_rejects", 1)
 			},
 		)
 	}()
 
 	// 7) Loader(s): batch rows and COPY to storage, always freeing rows.
+	var stageErr error
+	startLoader := time.Now()
 	var wgLoaders sync.WaitGroup
 	wgLoaders.Add(rt.loaderWorkers)
 
@@ -378,6 +418,10 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 	// Wait for validator and loaders; then stop error logger.
 	wgValidator.Wait()
 	wgLoaders.Wait()
+	defer func() {
+		metrics.RecordStep(spec.Job, "loader", stageErr, time.Since(startLoader))
+	}()
+
 	close(errCh)
 	wgErr.Wait()
 
@@ -536,9 +580,16 @@ func runLoader(cfg loaderConfig, wg *sync.WaitGroup) {
 		for _, r := range bRows {
 			r.Free()
 		}
+		inserted := int64(len(bVals))
 
-		cfg.stats.inserted.Add(int64(len(bVals)))
+		//cfg.stats.inserted.Add(int64(len(bVals)))
+		cfg.stats.AddInserted(inserted)
+
+		//		metrics.RecordRow(cfg.jobName, "inserted", inserted)
+
 		batchNum := cfg.stats.batches.Add(1)
+		cfg.stats.IncBatches()
+
 		duration := cfg.clockNowFn().Sub(start)
 		totalInserted := cfg.stats.inserted.Load()
 		rate := int64(float64(totalInserted) / duration.Seconds())
@@ -553,6 +604,7 @@ func runLoader(cfg loaderConfig, wg *sync.WaitGroup) {
 				duration.Truncate(time.Millisecond),
 			)
 		}
+		//		metrics.RecordBatches(cfg.jobName, 1)
 
 		bVals = bVals[:0]
 		bRows = bRows[:0]
@@ -656,6 +708,9 @@ func logGlobalSummary(c *counters) {
 		inserted,
 		batches,
 	)
+	//	if transformDropped >= 0 {
+	//		metrics.RecordRow(job, "transform_dropped", transformDropped)
+	//	}
 
 	// Optional sanity check during development to ensure conservation.
 	totalDataRows := processed + parseErrs
@@ -974,4 +1029,63 @@ func anchorRuleFromSpec(p config.Pipeline) *transformer.AnchorRule {
 		return &transformer.AnchorRule{Field: field, Value: value}
 	}
 	return nil
+}
+
+// IncProcessed increments the count of successfully parsed rows that
+// have entered the processing pipeline.
+//
+// This represents rows that were read successfully by the parser
+// and handed off for transformation.
+func (c *counters) IncProcessed() {
+	c.processed.Add(1)
+	metrics.RecordRow(c.job, "processed", 1)
+}
+
+// IncParseError increments the count of rows that failed during the
+// parsing stage (CSV/XML read failures).
+//
+// These rows never enter the transformation pipeline.
+func (c *counters) IncParseError() {
+	c.parseErrors.Add(1)
+	metrics.RecordRow(c.job, "parse_errors", 1)
+}
+
+// IncValidateDropped increments the count of rows that were rejected
+// by validation.
+//
+// These rows were well-formed but missing required fields or had
+// invalid values according to the contract.
+func (c *counters) IncValidateDropped() {
+	c.validateRejects.Add(1)
+	metrics.RecordRow(c.job, "validate_dropped", 1)
+}
+
+// IncTransformRejected increments the count of rows that were rejected
+// during the transform/coerce stage.
+//
+// These rows failed type coercion or other transform rules.
+func (c *counters) IncTransformRejected() {
+	c.transformRejects.Add(1)
+	metrics.RecordRow(c.job, "transform_rejected", 1)
+}
+
+// AddInserted increments the count of rows successfully written to
+// the storage backend.
+//
+// n represents the number of rows flushed as part of a batch.
+func (c *counters) AddInserted(n int64) {
+	if n <= 0 {
+		return
+	}
+	c.inserted.Add(n)
+	metrics.RecordRow(c.job, "inserted", n)
+}
+
+// IncBatches increments the count of database batches successfully
+// flushed to the storage backend.
+//
+// This is typically tied to COPY or bulk insert operations.
+func (c *counters) IncBatches() {
+	c.batches.Add(1)
+	metrics.RecordBatches(c.job, 1)
 }
