@@ -24,6 +24,7 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/datasource/file"
+	"etl/internal/parser"
 
 	csvparser "etl/internal/parser/csv"
 	xmlparser "etl/internal/parser/xml"
@@ -224,16 +225,27 @@ func runStreamed(ctx context.Context, spec config.Pipeline) error {
 				// XML streaming path: uses internal/parser/xml.StreamXMLRows, which
 				// consumes parser.options as an xml.Config JSON and emits *transformer.Row
 				// records aligned with storage.DB.Columns.
+
+				// If the pipeline uses the nested "xml_config" shape (as produced by ProbeURL
+				// and by your JSON config), unwrap it so StreamXMLRows sees the Config directly.
+				xmlOpts := spec.Parser.Options
+				if raw := xmlOpts.Any("xml_config"); raw != nil {
+					if m, ok := raw.(map[string]any); ok {
+						xmlOpts = config.Options(m)
+					}
+				}
+
 				if err := streamXMLRowsFn(
 					ctx,
 					src,
 					spec.Storage.DB.Columns,
-					spec.Parser.Options,
+					xmlOpts,
 					rawRowCh,
 					onParseErr,
 				); err != nil {
 					errCh <- RowErr{Err: err}
 				}
+
 			default:
 				errCh <- RowErr{Err: fmt.Errorf("unsupported parser.kind=%s", spec.Parser.Kind)}
 			}
@@ -672,22 +684,22 @@ func openSource(ctx context.Context, spec config.Pipeline) (io.ReadCloser, error
 }
 
 // buildParser maps parser configuration into a concrete parser implementation.
-//func buildParser(p config.Parser) (parser.Parser, error) {
-//	switch p.Kind {
-//	case "csv":
-//		opt := csvparser.Options{
-//			HasHeader:            p.Options.Bool("has_header", true),
-//			Comma:                p.Options.Rune("comma", ','),
-//			TrimSpace:            p.Options.Bool("trim_space", true),
-//			ExpectedFields:       p.Options.Int("expected_fields", 0),
-//			HeaderMap:            p.Options.StringMap("header_map"),
-//			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
-//		}
-//		return csvparser.NewParser(opt), nil
-//	default:
-//		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
-//	}
-//}
+func buildParser(p config.Parser) (parser.Parser, error) {
+	switch p.Kind {
+	case "csv":
+		opt := csvparser.Options{
+			HasHeader:            p.Options.Bool("has_header", true),
+			Comma:                p.Options.Rune("comma", ','),
+			TrimSpace:            p.Options.Bool("trim_space", true),
+			ExpectedFields:       p.Options.Int("expected_fields", 0),
+			HeaderMap:            p.Options.StringMap("header_map"),
+			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
+		}
+		return csvparser.NewParser(opt), nil
+	default:
+		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
+	}
+}
 
 // normalizedKindsFromSpec returns a mapping of column name -> normalized kind
 // for the streaming validator.
