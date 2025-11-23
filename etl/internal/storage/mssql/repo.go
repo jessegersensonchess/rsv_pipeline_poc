@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 
 	mssql "github.com/microsoft/go-mssqldb"
@@ -46,127 +45,128 @@ func NewRepository(ctx context.Context, cfg Config) (*Repository, func(), error)
 	return &Repository{db: db, cfg: cfg}, close, nil
 }
 
-// BulkUpsert performs a delete-then-insert via a session-scoped temporary table.
-func (r *Repository) BulkUpsert(
-	ctx context.Context,
-	recs []map[string]any,
-	keyColumns []string,
-	_ string, // dateColumn unused (parity with interface)
-) (int64, error) {
-	if len(recs) == 0 {
-		return 0, nil
-	}
-	cols := r.cfg.Columns
-	if len(cols) == 0 {
-		return 0, fmt.Errorf("no columns configured")
-	}
-
-	tmp := "#tmp_" + strings.ReplaceAll(r.cfg.Table, ".", "_")
-	fqTable := msFQN(r.cfg.Table)
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
-	}
-	rollback := func() { _ = tx.Rollback() }
-
-	// 1) Create temp table with same shape as target.
-	create := fmt.Sprintf(
-		"SELECT TOP 0 %s INTO %s FROM %s WITH (HOLDLOCK)",
-		strings.Join(mapIdent(cols), ","),
-		msIdent(tmp),
-		fqTable,
-	)
-	if _, err := tx.ExecContext(ctx, create); err != nil {
-		rollback()
-		return 0, fmt.Errorf("create temp: %w", err)
-	}
-
-	// 2) Add diagnostic column.
-	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("ALTER TABLE %s ADD %s INT NULL", msIdent(tmp), msIdent("__rownum")),
-	); err != nil {
-		rollback()
-		return 0, fmt.Errorf("alter temp: %w", err)
-	}
-
-	// 3) Bulk copy rows into #tmp.
-	colsWithRow := append(append([]string{}, cols...), "__rownum")
-	stmt, err := tx.PrepareContext(ctx, mssql.CopyIn(tmp, mssql.BulkOptions{}, colsWithRow...))
-	if err != nil {
-		rollback()
-		return 0, fmt.Errorf("prepare bulk copy: %w", err)
-	}
-
-	const rownumBase = 2 // CSV data starts on line 2
-	for i, rec := range recs {
-		row := make([]any, len(colsWithRow))
-		for j, c := range cols {
-			row[j] = toCopyVal(rec[c])
-		}
-		row[len(colsWithRow)-1] = i + rownumBase
-		if _, err := stmt.ExecContext(ctx, row...); err != nil {
-			_ = stmt.Close()
-			rollback()
-			return 0, fmt.Errorf("bulk row %d: %w", i, err)
-		}
-	}
-	res, err := stmt.ExecContext(ctx) // flush
-	if cerr := stmt.Close(); cerr != nil && err == nil {
-		err = cerr
-	}
-	if err != nil {
-		rollback()
-		return 0, fmt.Errorf("bulk finalize: %w", err)
-	}
-	copied, err := res.RowsAffected()
-	if err != nil {
-		rollback()
-		return 0, fmt.Errorf("rows affected: %w", err)
-	}
-	log.Printf("Successfully bulk-copied %d rows into %s", copied, tmp)
-
-	// 4) Delete matching rows if keys provided.
-	if len(keyColumns) > 0 {
-		cond := buildDeleteCondition(keyColumns)
-		del := fmt.Sprintf(
-			`DELETE T
-			   FROM %s AS T
-			   INNER JOIN %s AS S
-			       ON %s`,
-			fqTable, msIdent(tmp), cond,
-		)
-		if _, err := tx.ExecContext(ctx, del); err != nil {
-			rollback()
-			return 0, fmt.Errorf("delete matching rows: %w", err)
-		}
-	}
-
-	// 5) Insert into target excluding "id".
-	var colsWithoutID []string
-	for _, c := range cols {
-		if c != "id" {
-			colsWithoutID = append(colsWithoutID, c)
-		}
-	}
-	insert := fmt.Sprintf(
-		`INSERT INTO %s (%s)
-		  SELECT %s FROM %s`,
-		fqTable,
-		strings.Join(mapIdent(colsWithoutID), ","),
-		strings.Join(mapIdent(colsWithoutID), ","),
-		msIdent(tmp),
-	)
-	if _, err := tx.ExecContext(ctx, insert); err != nil {
-		rollback()
-		return 0, fmt.Errorf("insert phase: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit: %w", err)
-	}
-	return copied, nil
-}
+// depreciated: confirm it's not used, then remove
+// // BulkUpsert performs a delete-then-insert via a session-scoped temporary table.
+// func (r *Repository) BulkUpsert(
+// 	ctx context.Context,
+// 	recs []map[string]any,
+// 	keyColumns []string,
+// 	_ string, // dateColumn unused (parity with interface)
+// ) (int64, error) {
+// 	if len(recs) == 0 {
+// 		return 0, nil
+// 	}
+// 	cols := r.cfg.Columns
+// 	if len(cols) == 0 {
+// 		return 0, fmt.Errorf("no columns configured")
+// 	}
+//
+// 	tmp := "#tmp_" + strings.ReplaceAll(r.cfg.Table, ".", "_")
+// 	fqTable := msFQN(r.cfg.Table)
+//
+// 	tx, err := r.db.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return 0, fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	rollback := func() { _ = tx.Rollback() }
+//
+// 	// 1) Create temp table with same shape as target.
+// 	create := fmt.Sprintf(
+// 		"SELECT TOP 0 %s INTO %s FROM %s WITH (HOLDLOCK)",
+// 		strings.Join(mapIdent(cols), ","),
+// 		msIdent(tmp),
+// 		fqTable,
+// 	)
+// 	if _, err := tx.ExecContext(ctx, create); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("create temp: %w", err)
+// 	}
+//
+// 	// 2) Add diagnostic column.
+// 	if _, err := tx.ExecContext(ctx,
+// 		fmt.Sprintf("ALTER TABLE %s ADD %s INT NULL", msIdent(tmp), msIdent("__rownum")),
+// 	); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("alter temp: %w", err)
+// 	}
+//
+// 	// 3) Bulk copy rows into #tmp.
+// 	colsWithRow := append(append([]string{}, cols...), "__rownum")
+// 	stmt, err := tx.PrepareContext(ctx, mssql.CopyIn(tmp, mssql.BulkOptions{}, colsWithRow...))
+// 	if err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("prepare bulk copy: %w", err)
+// 	}
+//
+// 	const rownumBase = 2 // CSV data starts on line 2
+// 	for i, rec := range recs {
+// 		row := make([]any, len(colsWithRow))
+// 		for j, c := range cols {
+// 			row[j] = toCopyVal(rec[c])
+// 		}
+// 		row[len(colsWithRow)-1] = i + rownumBase
+// 		if _, err := stmt.ExecContext(ctx, row...); err != nil {
+// 			_ = stmt.Close()
+// 			rollback()
+// 			return 0, fmt.Errorf("bulk row %d: %w", i, err)
+// 		}
+// 	}
+// 	res, err := stmt.ExecContext(ctx) // flush
+// 	if cerr := stmt.Close(); cerr != nil && err == nil {
+// 		err = cerr
+// 	}
+// 	if err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("bulk finalize: %w", err)
+// 	}
+// 	copied, err := res.RowsAffected()
+// 	if err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("rows affected: %w", err)
+// 	}
+// 	log.Printf("Successfully bulk-copied %d rows into %s", copied, tmp)
+//
+// 	// 4) Delete matching rows if keys provided.
+// 	if len(keyColumns) > 0 {
+// 		cond := buildDeleteCondition(keyColumns)
+// 		del := fmt.Sprintf(
+// 			`DELETE T
+// 			   FROM %s AS T
+// 			   INNER JOIN %s AS S
+// 			       ON %s`,
+// 			fqTable, msIdent(tmp), cond,
+// 		)
+// 		if _, err := tx.ExecContext(ctx, del); err != nil {
+// 			rollback()
+// 			return 0, fmt.Errorf("delete matching rows: %w", err)
+// 		}
+// 	}
+//
+// 	// 5) Insert into target excluding "id".
+// 	var colsWithoutID []string
+// 	for _, c := range cols {
+// 		if c != "id" {
+// 			colsWithoutID = append(colsWithoutID, c)
+// 		}
+// 	}
+// 	insert := fmt.Sprintf(
+// 		`INSERT INTO %s (%s)
+// 		  SELECT %s FROM %s`,
+// 		fqTable,
+// 		strings.Join(mapIdent(colsWithoutID), ","),
+// 		strings.Join(mapIdent(colsWithoutID), ","),
+// 		msIdent(tmp),
+// 	)
+// 	if _, err := tx.ExecContext(ctx, insert); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("insert phase: %w", err)
+// 	}
+//
+// 	if err := tx.Commit(); err != nil {
+// 		return 0, fmt.Errorf("commit: %w", err)
+// 	}
+// 	return copied, nil
+// }
 
 // CopyFrom performs a bulk insert directly into the configured target table.
 func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {

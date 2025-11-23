@@ -363,7 +363,6 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 
 	var cfg jsonConfig
 
-	// source
 	cfg.Source.Kind = "file"
 	cfg.Source.File.Path = "testdata/" + normName + ".csv"
 
@@ -372,7 +371,7 @@ func buildJSONConfig(name string, headers []string, rows [][]string, inferred []
 		ReaderWorkers:    1,
 		TransformWorkers: 1,
 		LoaderWorkers:    1,
-		BatchSize:        5000,
+		BatchSize:        1,
 		ChannelBuffer:    1000,
 	}
 

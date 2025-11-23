@@ -29,6 +29,9 @@ import "encoding/json"
 // Pipeline describes the full ETL pipeline in JSON. It is the top-level object
 // decoded from a pipeline file (e.g., configs/pipelines/*.json).
 type Pipeline struct {
+	// Job is a value used for metrics labeling
+	Job string `json:"job"`
+
 	// Source describes where input data comes from (e.g., local file).
 	Source Source `json:"source"`
 
