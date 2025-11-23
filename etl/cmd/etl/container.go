@@ -28,6 +28,7 @@ import (
 	"etl/internal/parser"
 
 	csvparser "etl/internal/parser/csv"
+	jsonparser "etl/internal/parser/json"
 	xmlparser "etl/internal/parser/xml"
 
 	"etl/internal/schema"
@@ -97,9 +98,13 @@ var (
 	// streamXMLRowsFn provides a test seam for the XML streaming adapter.
 	// In production it points to xmlparser.StreamXMLRows.
 	streamXMLRowsFn = xmlparser.StreamXMLRows
+
+	// streamJSONRowsFn provides a test seam for the JSON streaming adapter.
+	// In production it points to jsonparser.StreamJSONRows.
+	streamJSONRowsFn = jsonparser.StreamJSONRows
 )
 
-// runStreamed executes a full CSV/XML → coerce → validate → storage pipeline
+// runStreamed executes a full CSV/JSON/XML → coerce → validate → storage pipeline
 // in a streaming, batched, and concurrent fashion.
 //
 // Bad rows are dropped before the database (fail-soft semantics), while
@@ -259,6 +264,21 @@ func runStreamed(ctx context.Context, spec config.Pipeline) (err error) {
 					src,
 					spec.Storage.DB.Columns,
 					xmlOpts,
+					rawRowCh,
+					onParseErr,
+				); err != nil {
+					errCh <- RowErr{Err: err}
+				}
+
+			case "json":
+				// JSON streaming path: uses internal/parser/json.StreamJSONRows, which
+				// consumes parser.options (e.g. allow_arrays, flatten) and emits
+				// *transformer.Row records aligned with storage.DB.Columns.
+				if err := streamJSONRowsFn(
+					ctx,
+					src,
+					spec.Storage.DB.Columns,
+					spec.Parser.Options,
 					rawRowCh,
 					onParseErr,
 				); err != nil {
@@ -749,6 +769,16 @@ func buildParser(p config.Parser) (parser.Parser, error) {
 			StreamScrubLikvidaci: p.Options.Bool("stream_scrub_likvidaci", true),
 		}
 		return csvparser.NewParser(opt), nil
+
+		//	case "json":
+		//		// Map config.Options onto jsonparser.Options.
+		//		jopt := jsonparser.Options{
+		//			AllowArrays: p.Options.Bool("allow_arrays", true),
+		//			// Add more flags here if your json parser exposes them, e.g.:
+		//			// Flatten:     p.Options.Bool("flatten", true),
+		//			// RootPath:    p.Options.String("root_path", ""),
+		//		}
+		//		return jsonparser.NewParser(jopt), nil
 	default:
 		return nil, fmt.Errorf("unsupported parser.kind=%s", p.Kind)
 	}
