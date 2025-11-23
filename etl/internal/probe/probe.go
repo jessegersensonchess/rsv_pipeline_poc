@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -13,8 +14,10 @@ import (
 	"etl/internal/datasource/file"
 	"etl/internal/datasource/httpds"
 	"etl/internal/inspect"
+	jsonparser "etl/internal/parser/json"
 	xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema"
+	"etl/pkg/records"
 )
 
 // Options control the sampling and output behavior.
@@ -316,6 +319,7 @@ const (
 	formatUnknown fileFormat = iota
 	formatCSV
 	formatXML
+	formatJSON
 )
 
 // ProbeURL runs the sample+infer pipeline for the given URL and returns a
@@ -323,6 +327,7 @@ const (
 // the sampled bytes.
 //
 // The resulting pipeline is intentionally conservative:
+//   - JSON: ??
 //   - CSV: coerce/validate chain with inferred types and a shared date layout.
 //   - XML: validate contract with type="text" by default, plus a starter XML
 //     parser config; coerce is omitted for now (strings remain as strings).
@@ -356,21 +361,13 @@ func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
 		}
 	}
 
-	//	switch ft {
-	//	case formatXML:
-	//		return probeXML(sample, opt)
-	//	case formatCSV, formatUnknown:
-	//		// Unknown: default to CSV; worst case, user edits config manually.
-	//		return probeCSV(sample, opt)
-	//	default:
-	//		return config.Pipeline{}, fmt.Errorf("unhandled format %v", ft)
-	//	}
-	//
 	var p config.Pipeline
 
 	switch ft {
 	case formatXML:
 		p, err = probeXML(sample, opt)
+	case formatJSON:
+		p, err = probeJSON(sample, opt)
 	case formatCSV, formatUnknown:
 		// Unknown: default to CSV; worst case, user edits config manually.
 		p, err = probeCSV(sample, opt)
@@ -390,13 +387,20 @@ func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
 }
 
 // detectFormat applies a very small heuristic on the sampled bytes to decide
-// whether the input looks like XML or CSV. It does not attempt to be perfect;
+// whether the input looks like JSON, XML or CSV. It does not attempt to be perfect;
 // the result is only a hint for initial config generation.
 func detectFormat(sample []byte) fileFormat {
 	s := bytes.TrimSpace(sample)
 	if len(s) == 0 {
 		return formatUnknown
 	}
+
+	// JSON: first non-space char is { or [
+	if s[0] == '{' || s[0] == '[' {
+		return formatJSON
+	}
+
+	// XML detection
 	ls := bytes.ToLower(s)
 	if bytes.HasPrefix(ls, []byte("<?xml")) || s[0] == '<' {
 		return formatXML
@@ -418,9 +422,186 @@ func writeSampleFile(name string, ft fileFormat, data []byte) error {
 		ext = ".csv"
 	case formatXML:
 		ext = ".xml"
+	case formatJSON:
+		ext = ".json"
 	}
 	return writeSampleCSV(base+ext, data)
 }
+
+// probeJSON builds a config.Pipeline for a JSON source.
+//
+// It is intentionally structural and does NOT hard-code field names:
+//   - It decodes JSON into records using internal/parser/json.
+//   - If there is a single top-level record containing one or more
+//     array-of-object fields, it picks the largest such array and treats
+//     its elements as the actual records (generic envelope handling).
+//   - It flattens nested objects into dotted paths (e.g., "user.id"),
+//     similar in spirit to how the XML config generator flattens structure.
+//   - It then reuses the CSV inference helpers to detect types/layouts and
+//     build coerce/validate transforms.
+func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
+	// Decode JSON records (object, array-of-objects, or JSONL/NDJSON via your
+	// jsonparser implementation).
+	recs, err := jsonparser.DecodeAll(bytes.NewReader(sample), jsonparser.Options{
+		AllowArrays: true,
+	})
+	if err != nil {
+		return config.Pipeline{}, fmt.Errorf("parse json sample: %w", err)
+	}
+	if len(recs) == 0 {
+		return config.Pipeline{}, fmt.Errorf("parse json sample: no records found")
+	}
+
+	// Structural envelope handling:
+	// If we have exactly one record with one or more array-of-object fields,
+	// pick the largest such array and treat its elements as the records.
+	recs = expandJSONRecords(recs)
+
+	// Flatten nested objects so that child fields become columns, analogous to
+	// how XML discovery produces flattened field names.
+	flatRecs := make([]records.Record, len(recs))
+	for i, r := range recs {
+		flat := make(records.Record)
+		flattenJSONRecord("", r, flat)
+		flatRecs[i] = flat
+	}
+
+	// Derive headers as the union of flattened keys, with deterministic order.
+	headerSet := make(map[string]struct{})
+	for _, r := range flatRecs {
+		for k := range r {
+			headerSet[k] = struct{}{}
+		}
+	}
+	headers := make([]string, 0, len(headerSet))
+	for k := range headerSet {
+		headers = append(headers, k)
+	}
+	sort.Strings(headers)
+
+	// Build [][]string rows in header order from flattened records.
+	rows := make([][]string, len(flatRecs))
+	for i, r := range flatRecs {
+		row := make([]string, len(headers))
+		for j, h := range headers {
+			row[j] = fmt.Sprint(r[h]) // inference works over string patterns
+		}
+		rows[i] = row
+	}
+
+	// Reuse CSV type/layout inference.
+	types := inferTypes(headers, rows)
+	colLayouts := detectColumnLayouts(rows, types)
+	coerceLayout := chooseMajorityLayout(colLayouts, types)
+
+	// Build contract fields and normalized column names.
+	fields := make([]schema.Field, 0, len(headers))
+	normalizedCols := make([]string, 0, len(headers))
+	normByHeader := make(map[string]string, len(headers))
+
+	for _, h := range headers {
+		n := truncateFieldName(normalizeFieldName(h))
+		normByHeader[h] = n
+		normalizedCols = append(normalizedCols, n)
+	}
+
+	requiredCounter := 0
+	for i, h := range headers {
+		ct := contractTypeFromInference(types[i])
+		f := schema.Field{
+			Name:     normByHeader[h],
+			Type:     ct,
+			Required: false,
+		}
+
+		// Heuristic: first integer column with no empties is required.
+		if types[i] == "integer" && allNonEmptySample(rows, i) && requiredCounter == 0 {
+			f.Required = true
+			requiredCounter++
+		}
+
+		// Layout for date/timestamp columns.
+		if types[i] == "date" || types[i] == "timestamp" {
+			if lay := colLayouts[i]; lay != "" {
+				f.Layout = lay
+			}
+		}
+
+		// Truthy/falsy for booleans.
+		if types[i] == "boolean" {
+			f.Truthy = []string{"1", "t", "true", "yes", "y"}
+			f.Falsy = []string{"0", "f", "false", "no", "n"}
+		}
+
+		fields = append(fields, f)
+	}
+
+	// Build coerce types map (skip explicit text).
+	coerceTypes := make(map[string]string, len(headers))
+	for i, h := range headers {
+		t := contractTypeFromInference(types[i])
+		if t != "text" {
+			coerceTypes[normByHeader[h]] = t
+		}
+	}
+
+	// Build pipeline (mirrors probeCSV, but with "json" parser and .json path).
+	var p config.Pipeline
+
+	// Source: suggest a local file path; user will edit as needed.
+	p.Source.Kind = "file"
+	p.Source.File.Path = normalizeFieldName(opt.Name) + ".json"
+
+	// Runtime: conservative defaults; user may tune later.
+	p.Runtime = config.RuntimeConfig{
+		ReaderWorkers:    1,
+		TransformWorkers: 1,
+		LoaderWorkers:    1,
+		BatchSize:        1,
+		ChannelBuffer:    1000,
+	}
+
+	// Parser config: allow arrays and carry a header_map so the streaming
+	// JSON parser can map original JSON field names onto normalized columns,
+	// just like the CSV path does.
+	p.Parser.Kind = "json"
+	p.Parser.Options = config.Options{
+		"allow_arrays": true,
+		"header_map":   buildHeaderMap(headers, normByHeader),
+	}
+
+	// Transform chain: coerce then validate.
+	coerceOpt := config.Options{
+		"layout": coerceLayout,
+		"types":  coerceTypes,
+	}
+	coerce := config.Transform{
+		Kind:    "coerce",
+		Options: coerceOpt,
+	}
+
+	contract := schema.Contract{
+		Name:   normalizeFieldName(opt.Name),
+		Fields: fields,
+	}
+	validateOpt := config.Options{
+		"policy":   "lenient",
+		"contract": contract,
+	}
+	validate := config.Transform{
+		Kind:    "validate",
+		Options: validateOpt,
+	}
+	p.Transform = []config.Transform{coerce, validate}
+
+	// Storage: backend-specific defaults.
+	backend := normalizeBackendKind(opt.Backend)
+	p.Storage.Kind = backend
+	p.Storage.DB = defaultDBConfigForBackend(backend, opt.Name, normalizedCols)
+
+	return p, nil
+}
+
 
 // probeCSV builds a config.Pipeline for a CSV source using the existing CSV
 // sampling + type/layout inference heuristics.
@@ -725,4 +906,89 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// expandJSONRecords heuristically unwraps a "records-like" envelope without
+// hard-coding field names. If there is exactly one top-level record and it
+// contains one or more fields that are array-of-object, it picks the largest
+// such array and treats its elements as the actual records.
+//
+// If no such array-of-object field exists, it returns the input unchanged.
+func expandJSONRecords(in []records.Record) []records.Record {
+	if len(in) != 1 {
+		return in
+	}
+	r := in[0]
+
+	type candidate struct {
+		recs []records.Record
+	}
+
+	var best candidate
+
+	for _, v := range r {
+		arr, ok := v.([]any)
+		if !ok || len(arr) == 0 {
+			continue
+		}
+
+		objs := make([]records.Record, 0, len(arr))
+		for _, elem := range arr {
+			m, ok := elem.(map[string]any)
+			if !ok {
+				objs = nil
+				break
+			}
+			objs = append(objs, records.Record(m))
+		}
+		if len(objs) == 0 {
+			continue
+		}
+
+		if len(objs) > len(best.recs) {
+			best.recs = objs
+		}
+	}
+
+	if len(best.recs) > 0 {
+		return best.recs
+	}
+	return in
+}
+
+// flattenJSONRecord flattens nested JSON structures into dotted-path keys,
+// e.g. { "user": { "id": 1, "name": "x" } } becomes:
+//
+//	"user.id" = 1
+//	"user.name" = "x"
+//
+// Arrays are left as-is (the entire []any is stored), and will be stringified
+// later for inference; this keeps the logic simple and matches the ETL’s
+// "text first" bias for complex types.
+func flattenJSONRecord(prefix string, in records.Record, out records.Record) {
+	for k, v := range in {
+		key := k
+		if prefix != "" {
+			key = prefix + "." + k
+		}
+		flattenJSONValue(key, v, out)
+	}
+}
+
+func flattenJSONValue(key string, v any, out records.Record) {
+	switch t := v.(type) {
+	case map[string]any:
+		// Nested object → recurse.
+		for k2, v2 := range t {
+			subKey := key + "." + k2
+			flattenJSONValue(subKey, v2, out)
+		}
+	case records.Record:
+		// In case our decoder ever yields records.Record directly.
+		flattenJSONRecord(key, t, out)
+	default:
+		// Arrays and scalars are kept as-is; arrays will later be stringified
+		// when building rows for inference.
+		out[key] = v
+	}
 }

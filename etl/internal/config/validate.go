@@ -128,8 +128,9 @@ func validateParser(p Parser) []Issue {
 	}
 
 	known := map[string]struct{}{
-		"csv": {},
-		"xml": {},
+		"csv":  {},
+		"xml":  {},
+		"json": {},
 	}
 	if _, ok := known[p.Kind]; !ok {
 		issues = append(issues, Issue{
@@ -154,6 +155,9 @@ func validateParser(p Parser) []Issue {
 		}
 	case "xml":
 		// XML config is validated in parser/xml; nothing obvious to check here.
+
+	case "json":
+		// XML config is validated in parser/json. not implemented
 	}
 
 	return issues
