@@ -12,7 +12,7 @@ import "strings"
 //	"timestamp"/"timestamptz" -> TIMESTAMPTZ
 //	everything else      -> TEXT
 func MapType(kind string) string {
-	switch strings.ToLower(kind) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "int", "integer":
 		return "BIGINT"
 	case "bigint":

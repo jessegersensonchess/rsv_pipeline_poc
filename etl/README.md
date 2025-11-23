@@ -1,13 +1,20 @@
 # Generic ETL
-go run ./cmd/csvprobe-web -addr :8080
 
 # TODO
-move ddl.create -> storage/[db]/ddl/create.go -- so mssql can create tables
-
-add metrics (something usable by both prometheus and datadog)
-
 add documentation
-    - xmlprobe
+    - probe
     - etl
         - config structure
         - example configs
+
+# Integration tests
+## mssql
+        source .env  
+        docker compose --profile mssql up --force-recreate -d  
+        export MSSQL_TEST_DSN='sqlserver://sa:P@ssw0rd123!@0.0.0.0:1433?database=testdb'  
+        go test ./... -tags=integration  
+
+## postgres
+    docker compose --profile postgres up --force-recreate -d  
+    export TEST_PG_DSN='postgresql://user:P@ssw0rd123!@0.0.0.0:5432/testdb?sslmode=disable'  
+    go test ./... -tags=integration  

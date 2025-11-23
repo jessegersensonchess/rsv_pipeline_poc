@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -297,4 +298,241 @@ func BenchmarkValidate_WithRejectCallback(b *testing.B) {
 		_ = v.Apply(in)
 	}
 	_ = rejCount
+}
+
+/*
+Test_normalizeKind_Table verifies that normalizeKind maps a variety of
+schema-ish types into the small validator kind set used by validateRecord.
+*/
+func Test_normalizeKind_Table(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "int", in: "int", want: "int"},
+		{name: "integer", in: "integer", want: "int"},
+		{name: "bigint", in: "bigint", want: "int"},
+		{name: "int4", in: "INT4", want: "int"},
+		{name: "int2", in: "int2", want: "int"},
+		{name: "boolean", in: "boolean", want: "bool"},
+		{name: "bool", in: "bool", want: "bool"},
+		{name: "date", in: "date", want: "date"},
+		{name: "timestamp", in: "timestamp", want: "date"},
+		{name: "timestamptz", in: "timestamptz", want: "date"},
+		{name: "text", in: "text", want: "string"},
+		{name: "string", in: "string", want: "string"},
+		{name: "unknown", in: "custom", want: "custom"},
+		{name: "mixed_case", in: "BoOlEaN", want: "bool"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := normalizeKind(tt.in)
+			if got != tt.want {
+				t.Fatalf("normalizeKind(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+/*
+Test_asString_VariousTypes verifies that asString handles common types without
+fmt.Sprint overhead and produces stable, human-readable values.
+*/
+func Test_asString_VariousTypes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, 11, 9, 1, 2, 3, 0, time.UTC)
+
+	tests := []struct {
+		name         string
+		in           any
+		wantContains string // substring to assert; empty => exact match
+		wantExact    string // if non-empty, require exact match
+	}{
+		{name: "nil", in: nil, wantExact: ""},
+		{name: "string", in: "x", wantExact: "x"},
+		{name: "int", in: 123, wantExact: "123"},
+		{name: "int32", in: int32(42), wantExact: "42"},
+		{name: "int64", in: int64(99), wantExact: "99"},
+		{name: "float64", in: 3.14, wantContains: "3.14"},
+		{name: "bool_true", in: true, wantExact: "true"},
+		{name: "bool_false", in: false, wantExact: "false"},
+		{name: "time", in: now, wantContains: now.Format(time.RFC3339)},
+		{name: "struct_fallback", in: struct{ X int }{X: 1}, wantContains: "{1}"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := asString(tt.in)
+			if tt.wantExact != "" && got != tt.wantExact {
+				t.Fatalf("asString(%T) = %q, want %q", tt.in, got, tt.wantExact)
+			}
+			if tt.wantContains != "" && !strings.Contains(got, tt.wantContains) {
+				t.Fatalf("asString(%T) = %q, want to contain %q", tt.in, got, tt.wantContains)
+			}
+		})
+	}
+}
+
+/*
+Test_isBoolInSets_DefaultAndCustom verifies that isBoolInSets respects the
+default truthy/falsy sets and custom sets, assuming the input is already
+lowercased as documented.
+*/
+func Test_isBoolInSets_DefaultAndCustom(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		name   string
+		s      string
+		truthy map[string]struct{}
+		falsy  map[string]struct{}
+		want   bool
+	}
+
+	customTruthy := map[string]struct{}{"y": {}, "ok": {}}
+	customFalsy := map[string]struct{}{"n": {}, "nope": {}}
+
+	tests := []testCase{
+		// Defaults
+		{name: "default_true", s: "true", want: true},
+		{name: "default_false", s: "false", want: true},
+		{name: "default_yes", s: "yes", want: true},
+		{name: "default_no", s: "no", want: true},
+		{name: "default_czech_ano", s: "ano", want: true},
+		{name: "default_czech_ne", s: "ne", want: true},
+		{name: "default_unknown", s: "maybe", want: false},
+
+		// Custom sets (input already lowercased)
+		{name: "custom_truthy_y", s: "y", truthy: customTruthy, falsy: customFalsy, want: true},
+		{name: "custom_truthy_ok", s: "ok", truthy: customTruthy, falsy: customFalsy, want: true},
+		{name: "custom_falsy_n", s: "n", truthy: customTruthy, falsy: customFalsy, want: true},
+		{name: "custom_falsy_nope", s: "nope", truthy: customTruthy, falsy: customFalsy, want: true},
+		{name: "custom_unknown", s: "maybe", truthy: customTruthy, falsy: customFalsy, want: false},
+
+		// Empty string -> treated as allowed by helper (required logic handles emptiness)
+		{name: "empty_string", s: "", want: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := isBoolInSets(tt.s, tt.truthy, tt.falsy)
+			if got != tt.want {
+				t.Fatalf("isBoolInSets(%q, custom=%t) = %v, want %v",
+					tt.s, tt.truthy != nil || tt.falsy != nil, got, tt.want)
+			}
+		})
+	}
+}
+
+/*
+Test_parseAnyDate_Paths verifies that parseAnyDate respects field-specific
+layouts, ISO 8601, global fallback layout, and rejects unsupported formats.
+*/
+func Test_parseAnyDate_Paths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		s            string
+		fieldLayout  string
+		globalLayout string
+		want         bool
+	}{
+		{name: "empty_ok", s: "", fieldLayout: "", globalLayout: "", want: true},
+		{name: "iso_default", s: "2025-11-09", fieldLayout: "", globalLayout: "", want: true},
+		{name: "field_layout", s: "09.11.2025", fieldLayout: "02.01.2006", globalLayout: "", want: true},
+		{name: "global_layout", s: "2025/11/09", fieldLayout: "", globalLayout: "2006/01/02", want: true},
+		{name: "no_match", s: "11/09/25", fieldLayout: "", globalLayout: "", want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := parseAnyDate(tt.s, tt.fieldLayout, tt.globalLayout)
+			if got != tt.want {
+				t.Fatalf("parseAnyDate(%q, %q, %q) = %v, want %v",
+					tt.s, tt.fieldLayout, tt.globalLayout, got, tt.want)
+			}
+		})
+	}
+}
+
+/*
+TestValidate_buildMeta_Idempotent verifies that buildMeta constructs fieldMeta
+exactly once even when called concurrently, and that enum/truthy/falsy sets
+are populated as expected.
+*/
+func TestValidate_buildMeta_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	contract := schema.Contract{
+		Fields: []schema.Field{
+			{
+				Name:     "status",
+				Type:     "string",
+				Required: true,
+				Enum:     []string{"new", "ok", "done"},
+				Truthy:   []string{"Y", "OK"},
+				Falsy:    []string{"N", "NO"},
+			},
+		},
+	}
+
+	v := &Validate{Contract: contract}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			v.buildMeta()
+		}()
+	}
+	wg.Wait()
+
+	if len(v.meta) != 1 {
+		t.Fatalf("v.meta length = %d, want 1", len(v.meta))
+	}
+	m := v.meta[0]
+	if m.name != "status" {
+		t.Fatalf("meta.name = %q, want %q", m.name, "status")
+	}
+	if m.kind != "string" {
+		t.Fatalf("meta.kind = %q, want %q", m.kind, "string")
+	}
+	if !m.required {
+		t.Fatalf("meta.required = false, want true")
+	}
+	if len(m.enumSet) != len(contract.Fields[0].Enum) {
+		t.Fatalf("meta.enumSet size = %d, want %d", len(m.enumSet), len(contract.Fields[0].Enum))
+	}
+	// Truthy/falsy maps are lowercased.
+	for _, s := range contract.Fields[0].Truthy {
+		if _, ok := m.truthySet[strings.ToLower(s)]; !ok {
+			t.Fatalf("truthySet missing %q (lowercased)", s)
+		}
+	}
+	for _, s := range contract.Fields[0].Falsy {
+		if _, ok := m.falsySet[strings.ToLower(s)]; !ok {
+			t.Fatalf("falsySet missing %q (lowercased)", s)
+		}
+	}
 }

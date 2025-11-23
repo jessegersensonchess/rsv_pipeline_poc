@@ -46,104 +46,105 @@ func NewRepository(ctx context.Context, cfg Config) (*Repository, func(), error)
 	return &Repository{db: db, cfg: cfg}, close, nil
 }
 
-// BulkUpsert performs a delete-then-insert via a session-scoped TEMPORARY TABLE.
-// Steps:
-//  1. CREATE TEMPORARY TABLE tmp AS SELECT <cols> FROM target WHERE 1=0
-//  2. ALTER TABLE tmp ADD COLUMN `__rownum` INT NULL
-//  3. Multi-row INSERT INTO tmp
-//  4. If key columns provided: DELETE T FROM target T INNER JOIN tmp S ON ...
-//  5. INSERT INTO target(<cols-without-id>) SELECT <cols-without-id> FROM tmp
+// depreciated
+// // BulkUpsert performs a delete-then-insert via a session-scoped TEMPORARY TABLE.
+// // Steps:
+// //  1. CREATE TEMPORARY TABLE tmp AS SELECT <cols> FROM target WHERE 1=0
+// //  2. ALTER TABLE tmp ADD COLUMN `__rownum` INT NULL
+// //  3. Multi-row INSERT INTO tmp
+// //  4. If key columns provided: DELETE T FROM target T INNER JOIN tmp S ON ...
+// //  5. INSERT INTO target(<cols-without-id>) SELECT <cols-without-id> FROM tmp
+// //
+// // Returns the number of rows inserted into the temp table.
+// func (r *Repository) BulkUpsert(
+// 	ctx context.Context,
+// 	recs []map[string]any,
+// 	keyColumns []string,
+// 	_ string, // dateColumn unused; kept for parity with interface
+// ) (int64, error) {
+// 	if len(recs) == 0 {
+// 		return 0, nil
+// 	}
+// 	cols := r.cfg.Columns
+// 	if len(cols) == 0 {
+// 		return 0, fmt.Errorf("no columns configured")
+// 	}
 //
-// Returns the number of rows inserted into the temp table.
-func (r *Repository) BulkUpsert(
-	ctx context.Context,
-	recs []map[string]any,
-	keyColumns []string,
-	_ string, // dateColumn unused; kept for parity with interface
-) (int64, error) {
-	if len(recs) == 0 {
-		return 0, nil
-	}
-	cols := r.cfg.Columns
-	if len(cols) == 0 {
-		return 0, fmt.Errorf("no columns configured")
-	}
-
-	tmp := "tmp_" + strings.ReplaceAll(r.cfg.Table, ".", "_")
-	fq := myFQN(r.cfg.Table)
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
-	}
-	rollback := func() { _ = tx.Rollback() }
-
-	// 1) Create temp table with the same selected columns.
-	create := fmt.Sprintf(
-		"CREATE TEMPORARY TABLE %s AS SELECT %s FROM %s WHERE 1=0",
-		myIdent(tmp), strings.Join(mapIdent(cols), ","), fq,
-	)
-	if _, err := tx.ExecContext(ctx, create); err != nil {
-		rollback()
-		return 0, fmt.Errorf("create temp: %w", err)
-	}
-
-	// 2) Add diagnostic column.
-	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s INT NULL", myIdent(tmp), myIdent("__rownum")),
-	); err != nil {
-		rollback()
-		return 0, fmt.Errorf("alter temp: %w", err)
-	}
-
-	// 3) Insert rows into the temp table (multi-row insert).
-	colsWithRow := append(append([]string{}, cols...), "__rownum")
-	if _, err := insertMulti(ctx, tx, tmp, colsWithRow, recs); err != nil {
-		rollback()
-		return 0, fmt.Errorf("insert into temp: %w", err)
-	}
-	copied := int64(len(recs))
-
-	// 4) Delete matching rows if keys provided.
-	if len(keyColumns) > 0 {
-		cond := buildDeleteCondition(keyColumns)
-		del := fmt.Sprintf(
-			`DELETE T FROM %s AS T
-			 INNER JOIN %s AS S
-			    ON %s`,
-			fq, myIdent(tmp), cond,
-		)
-		if _, err := tx.ExecContext(ctx, del); err != nil {
-			rollback()
-			return 0, fmt.Errorf("delete matching rows: %w", err)
-		}
-	}
-
-	// 5) Insert into target excluding "id".
-	var colsNoID []string
-	for _, c := range cols {
-		if c != "id" {
-			colsNoID = append(colsNoID, c)
-		}
-	}
-	insert := fmt.Sprintf(
-		`INSERT INTO %s (%s)
-		  SELECT %s FROM %s`,
-		fq,
-		strings.Join(mapIdent(colsNoID), ","),
-		strings.Join(mapIdent(colsNoID), ","),
-		myIdent(tmp),
-	)
-	if _, err := tx.ExecContext(ctx, insert); err != nil {
-		rollback()
-		return 0, fmt.Errorf("insert phase: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit: %w", err)
-	}
-	return copied, nil
-}
+// 	tmp := "tmp_" + strings.ReplaceAll(r.cfg.Table, ".", "_")
+// 	fq := myFQN(r.cfg.Table)
+//
+// 	tx, err := r.db.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return 0, fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	rollback := func() { _ = tx.Rollback() }
+//
+// 	// 1) Create temp table with the same selected columns.
+// 	create := fmt.Sprintf(
+// 		"CREATE TEMPORARY TABLE %s AS SELECT %s FROM %s WHERE 1=0",
+// 		myIdent(tmp), strings.Join(mapIdent(cols), ","), fq,
+// 	)
+// 	if _, err := tx.ExecContext(ctx, create); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("create temp: %w", err)
+// 	}
+//
+// 	// 2) Add diagnostic column.
+// 	if _, err := tx.ExecContext(ctx,
+// 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s INT NULL", myIdent(tmp), myIdent("__rownum")),
+// 	); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("alter temp: %w", err)
+// 	}
+//
+// 	// 3) Insert rows into the temp table (multi-row insert).
+// 	colsWithRow := append(append([]string{}, cols...), "__rownum")
+// 	if _, err := insertMulti(ctx, tx, tmp, colsWithRow, recs); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("insert into temp: %w", err)
+// 	}
+// 	copied := int64(len(recs))
+//
+// 	// 4) Delete matching rows if keys provided.
+// 	if len(keyColumns) > 0 {
+// 		cond := buildDeleteCondition(keyColumns)
+// 		del := fmt.Sprintf(
+// 			`DELETE T FROM %s AS T
+// 			 INNER JOIN %s AS S
+// 			    ON %s`,
+// 			fq, myIdent(tmp), cond,
+// 		)
+// 		if _, err := tx.ExecContext(ctx, del); err != nil {
+// 			rollback()
+// 			return 0, fmt.Errorf("delete matching rows: %w", err)
+// 		}
+// 	}
+//
+// 	// 5) Insert into target excluding "id".
+// 	var colsNoID []string
+// 	for _, c := range cols {
+// 		if c != "id" {
+// 			colsNoID = append(colsNoID, c)
+// 		}
+// 	}
+// 	insert := fmt.Sprintf(
+// 		`INSERT INTO %s (%s)
+// 		  SELECT %s FROM %s`,
+// 		fq,
+// 		strings.Join(mapIdent(colsNoID), ","),
+// 		strings.Join(mapIdent(colsNoID), ","),
+// 		myIdent(tmp),
+// 	)
+// 	if _, err := tx.ExecContext(ctx, insert); err != nil {
+// 		rollback()
+// 		return 0, fmt.Errorf("insert phase: %w", err)
+// 	}
+//
+// 	if err := tx.Commit(); err != nil {
+// 		return 0, fmt.Errorf("commit: %w", err)
+// 	}
+// 	return copied, nil
+// }
 
 // CopyFrom performs a batch INSERT into the configured target table. It is used
 // by the streaming loader. Rows are grouped into a single multi-row INSERT.

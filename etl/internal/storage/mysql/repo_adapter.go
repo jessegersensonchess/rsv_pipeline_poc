@@ -39,15 +39,15 @@ type wrappedRepo struct {
 // Close closes the underlying connection pool.
 func (w *wrappedRepo) Close() { w.closeFn() }
 
-// BulkUpsert adapts the legacy signature (map[string]any) to our implementation.
-func (w *wrappedRepo) BulkUpsert(
-	ctx context.Context,
-	rows []map[string]any,
-	keyColumns []string,
-	dateColumn string,
-) (int64, error) {
-	return w.Repository.BulkUpsert(ctx, rows, keyColumns, dateColumn)
-}
+// // BulkUpsert adapts the legacy signature (map[string]any) to our implementation.
+// func (w *wrappedRepo) BulkUpsert(
+// 	ctx context.Context,
+// 	rows []map[string]any,
+// 	keyColumns []string,
+// 	dateColumn string,
+// ) (int64, error) {
+// 	return w.Repository.BulkUpsert(ctx, rows, keyColumns, dateColumn)
+// }
 
 // CopyFrom delegates to the underlying repository.
 func (w *wrappedRepo) CopyFrom(
