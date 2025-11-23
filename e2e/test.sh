@@ -11,10 +11,6 @@
 # Run from e2e/ directory
 cd "$(dirname "$0")"
 
-# Clean artifacts
-rm -rf artifacts
-mkdir -p artifacts
-
 # 1 & 2. Build etl & probe via docker compose build
 docker compose build
 

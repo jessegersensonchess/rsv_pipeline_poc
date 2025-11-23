@@ -46,6 +46,21 @@ func main() {
 		fatalf("decode config: %v", err)
 	}
 
+	//	// validator
+	//
+	issues := config.ValidatePipeline(p)
+	hasError := false
+	for _, iss := range issues {
+		fmt.Fprintf(os.Stderr, "%s: %s: %s\n", iss.Severity, iss.Path, iss.Message)
+		if iss.Severity == config.SeverityError {
+			hasError = true
+		}
+	}
+	if hasError {
+		os.Exit(1)
+	}
+	//
+	// end validator
 	// Decide metrics backend based on env/config.
 	// Example: METRICS_BACKEND=prom_push PUSHGATEWAY_URL=...
 	metricsBackend := os.Getenv("METRICS_BACKEND")
