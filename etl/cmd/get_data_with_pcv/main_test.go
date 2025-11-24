@@ -1,29 +1,11 @@
 package main
 
 import (
+	"etl/internal/bitmap"
+	intscan "etl/internal/parser/ints"
 	"os"
 	"testing"
 )
-
-func TestNewBitmap(t *testing.T) {
-	tests := []struct {
-		maxID    int
-		expected int // expected length of the bitmap (in uint64 words)
-	}{
-		{0, 0},               // No IDs should result in an empty bitmap
-		{63, 1},              // One word for IDs [0-63]
-		{64, 1},              // One word for IDs [0-64]
-		{65, 2},              // Two words for IDs [0-65]
-		{150000000, 2343750}, // Larger ID range
-	}
-
-	for _, test := range tests {
-		bitmap := NewBitmap(test.maxID)
-		if len(bitmap.data) != test.expected {
-			t.Errorf("For maxID %d, expected bitmap size %d, got %d", test.maxID, test.expected, len(bitmap.data))
-		}
-	}
-}
 
 // TestAddAndHas tests the Add and Has methods of the Bitmap.
 func TestAddAndHas(t *testing.T) {
@@ -37,7 +19,7 @@ func TestAddAndHas(t *testing.T) {
 		{64, false}, // Test that 64 is not included without explicit addition
 	}
 
-	bitmap := NewBitmap(64)
+	bitmap := bitmap.New(64)
 	for _, test := range tests {
 		if test.expected {
 			bitmap.Add(test.id)
@@ -61,7 +43,7 @@ func TestExtractInts(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		got, _ := ExtractInts(test.input)
+		got, _ := intscan.ExtractInts(test.input)
 		if !equal(got, test.expected) {
 			t.Errorf("For input %q, expected %v, got %v", test.input, test.expected, got)
 		}
@@ -126,7 +108,7 @@ func TestCheckDataFileAgainstBitmap(t *testing.T) {
 	}
 
 	// Prepare the bitmap to match against
-	bitmap := NewBitmap(10)
+	bitmap := bitmap.New(10)
 	bitmap.Add(1)
 	bitmap.Add(2)
 	bitmap.Add(3)
