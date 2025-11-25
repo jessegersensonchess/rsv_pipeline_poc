@@ -25,11 +25,13 @@ func main() {
 		cfgPath           string
 		metricsBackendFlg string
 		pushGatewayURLFlg string
+		validate          bool
 	)
 
 	flag.StringVar(&cfgPath, "config", "configs/pipelines/sample.json", "pipeline config JSON path")
 	flag.StringVar(&metricsBackendFlg, "metrics-backend", "pushgateway", "metrics backend to use (e.g. pushgateway, none)")
 	flag.StringVar(&pushGatewayURLFlg, "pushgateway-url", "http://localhost:9091", "Pushgateway base URL (overrides env PUSHGATEWAY_URL)")
+	flag.BoolVar(&validate, "validate", false, "validate the configuration and exit")
 	verbose := flag.Bool("v", false, "enable verbose logs")
 
 	flag.Parse()
@@ -60,7 +62,15 @@ func main() {
 		}
 	}
 	if hasError {
+		log.Printf("Configuration is invalid: %v", cfgPath)
 		os.Exit(1)
+	}
+
+	// If validate flag is set, only validate the configuration and exit
+	if validate {
+		// If validation succeeds, exit with success
+		log.Printf("Configuration is valid: %v", cfgPath)
+		os.Exit(0)
 	}
 
 	// Decide metrics backend: flag → env → default.
