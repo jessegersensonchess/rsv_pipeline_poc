@@ -13,25 +13,30 @@ import (
 	"etl/internal/metrics"
 	"etl/internal/metrics/prompush"
 
-	//     metricsdatadog "etl/internal/metrics/datadog"
-
-	// register all backends with the stroage factory.
-	// config specifies which to use but we need to build in support for all of them
+	// register all backends with the storage factory.
+	// config specifies which to use but we need to build in support for all of them.
 	_ "etl/internal/storage/all"
 )
 
 // main is the entry point for the ETL binary. It loads the pipeline config,
-// sets up optional profiling, and executes the streaming pipeline run.
+// optionally initializes a metrics backend, and executes the streaming run.
 func main() {
-	var cfgPath string
+	var (
+		cfgPath           string
+		metricsBackendFlg string
+		pushGatewayURLFlg string
+	)
+
 	flag.StringVar(&cfgPath, "config", "configs/pipelines/sample.json", "pipeline config JSON path")
-	verbose := flag.Bool("v", false, "enable verbose logs") // default true as requested
-	//	debug := flag.Bool("d", false, "enable debug mode")
+	flag.StringVar(&metricsBackendFlg, "metrics-backend", "pushgateway", "metrics backend to use (e.g. pushgateway, none)")
+	flag.StringVar(&pushGatewayURLFlg, "pushgateway-url", "http://localhost:9091", "Pushgateway base URL (overrides env PUSHGATEWAY_URL)")
+	verbose := flag.Bool("v", false, "enable verbose logs")
 
 	flag.Parse()
 
 	if !*verbose {
-		log.SetOutput(os.Stderr) // still stderr, just less chatter if you gate logs yourself
+		// You could also adjust log flags here if you want quieter output.
+		log.SetOutput(os.Stderr)
 	}
 
 	f, err := os.Open(cfgPath)
@@ -40,14 +45,12 @@ func main() {
 	}
 	defer f.Close()
 
-	// Initialize the spec here, before using it
 	var p config.Pipeline
 	if err := json.NewDecoder(f).Decode(&p); err != nil {
 		fatalf("decode config: %v", err)
 	}
 
-	//	// validator
-	//
+	// Validate pipeline config.
 	issues := config.ValidatePipeline(p)
 	hasError := false
 	for _, iss := range issues {
@@ -59,18 +62,33 @@ func main() {
 	if hasError {
 		os.Exit(1)
 	}
-	//
-	// end validator
-	// Decide metrics backend based on env/config.
-	// Example: METRICS_BACKEND=prom_push PUSHGATEWAY_URL=...
-	metricsBackend := os.Getenv("METRICS_BACKEND")
-	switch metricsBackend {
+
+	// Decide metrics backend: flag → env → default.
+	backendName := metricsBackendFlg
+	if backendName == "" {
+		backendName = os.Getenv("METRICS_BACKEND")
+	}
+	switch backendName {
 	case "pushgateway":
-		gwURL := os.Getenv("PUSHGATEWAY_URL")
-		b, err := prompush.NewBackend(p.Job, gwURL)
+		// Decide Pushgateway URL: flag → env → default.
+		gwURL := pushGatewayURLFlg
+		if gwURL == "" {
+			gwURL = os.Getenv("PUSHGATEWAY_URL")
+		}
+		if gwURL == "" {
+			gwURL = "http://localhost:9091"
+		}
+
+		jobName := p.Job
+		if jobName == "" {
+			jobName = "etl_job"
+		}
+
+		b, err := prompush.NewBackend(jobName, gwURL)
 		if err != nil {
 			log.Printf("metrics: failed to init prom push backend: %v; using nop", err)
 		} else {
+			log.Printf("metrics: url=%v, backend=%v, job_name=%v", gwURL, backendName, jobName)
 			metrics.SetBackend(b)
 			defer func() {
 				if err := metrics.Flush(); err != nil {
@@ -78,46 +96,29 @@ func main() {
 				}
 			}()
 		}
-	//	    case "datadog":
-	//    ddCfg := metricsdatadog.Config{
-	//        Addr:       os.Getenv("DD_AGENT_ADDR"),   // e.g. "127.0.0.1:8125"
-	//        Namespace:  "etl.",
-	//        GlobalTags: []string{"job:" + spec.Job},
-	//    }
-	//    if b, err := metricsdatadog.NewBackend(ddCfg); err != nil {
-	//        log.Printf("metrics: datadog backend init failed: %v; using nop", err)
-	//    } else {
-	//        metrics.SetBackend(b)
-	//        defer func() {
-	//            if err := metrics.Flush(); err != nil {
-	//                log.Printf("metrics: flush error: %v", err)
-	//            }
-	//        }()
-	//    }
 
 	case "", "none":
 		// metrics disabled; nop backend remains
+		if *verbose {
+			log.Printf("metrics: disabled (backend=%q)", backendName)
+		}
 
 	default:
-		log.Printf("no metrics configured")
+		log.Printf("metrics: unknown backend %q; metrics disabled", backendName)
 	}
 
-	// Initialize the context here, before passing it to runStreamed()
 	ctx := context.Background()
-	start := time.Now() // Initialize start time
+	start := time.Now()
 
-	// Print the config information if verbose
 	if *verbose {
 		log.Printf("pipeline: source=%s parser=%s storage=%s table=%s",
 			p.Source.Kind, p.Parser.Kind, p.Storage.Kind, p.Storage.DB.Table)
 	}
 
-	// Execute the streaming pipeline
 	if err := runStreamed(ctx, p); err != nil {
 		log.Fatalf("%v", err)
 	}
 
-	// Optional: log total elapsed time when verbose
 	if *verbose {
 		log.Printf("completed in %s", time.Since(start).Truncate(time.Millisecond))
 	}

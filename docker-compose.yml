@@ -18,9 +18,9 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data:z
       # Any .sql/.sql.gz/.sh in this dir runs ONCE on first init
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro,z
 #      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro  # Custom config file
 
     healthcheck:
@@ -45,7 +45,7 @@ services:
     ports:
       - "1433:1433"
     volumes:
-      - mssql-data:/var/opt/mssql
+      - mssql-data:/var/opt/mssql:z
     healthcheck:
       test: ["CMD-SHELL", "pgrep sqlservr >/dev/null"]
       interval: 10s
@@ -69,64 +69,9 @@ services:
       APP_LOGIN: ${APP_LOGIN:-user}
       APP_PASSWORD: ${APP_PASSWORD:-password}
     volumes:
-      - ./mssql/init.sh:/init.sh:ro
+      - ./mssql/init.sh:/init.sh:ro,z
     entrypoint: ["/bin/bash", "-lc", "/init.sh"]
     restart: "no"
-
-#  # ---------------- Go App (imports CSV -> MSSQL) ----------------
-#  go-app-mssql:
-#    build:
-#      context: ./go-app
-#      dockerfile: Dockerfile
-#      network: host   # optional; only if your builder needs it
-#    container_name: go-app-mssql
-#    profiles: ["mssql"]
-#    depends_on:
-#      mssql:
-#        condition: service_healthy
-#    environment:
-#      TZ: ${TZ:-Europe/Prague}
-#      DB_DRIVER: mssql
-#      DB_DSN: >-
-#        sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable
-#      WORKERS: 8
-#      BATCH_SIZE: 2500
-#    volumes:
-#      - ./data:/data:ro
-#    command:
-#      [
-#        "/app/main",
-#        "--db-driver=mssql",
-#        "--dsn", "sqlserver://sa:${SA_PASSWORD}@mssql:1433?database=${MSSQL_DB:-MyDb}&encrypt=disable"
-#      ]
-
-#  # ---------------- Go App (imports CSV -> Postgres) ----------------
-#  go-app-postgres:
-#    build:
-#      context: ./go-app
-#      dockerfile: Dockerfile
-#      network: host   # optional; only if your builder needs it
-#    container_name: go-app-postgres
-#    profiles: ["postgres"]
-#    depends_on:
-#      postgres:
-#        condition: service_healthy
-#    environment:
-#      TZ: ${TZ:-Europe/Prague}
-#      DB_DRIVER: postgres
-#      # Env fallback (your app can read this if flags are ignored)
-#      DB_DSN: >-
-#        postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable
-#      WORKERS: 8
-#      BATCH_SIZE: 3000
-#    volumes:
-#      - ./data:/data:ro
-#    command:
-#      [
-#        "/app/main",
-#        "--db-driver=postgres",
-#        "--dsn", "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-testdb}?sslmode=disable"
-#      ]
 
   # ---------------- Go Unit Tests ----------------
   go-tests:
@@ -135,7 +80,7 @@ services:
     profiles: ["test"]
     working_dir: /workspace
     volumes:
-      - ./:/workspace
+      - ./:/workspace:z
     environment:
       TZ: ${TZ:-Europe/Prague}
     # Run all tests (verbose + race + cover); adjust as you like
@@ -145,18 +90,6 @@ services:
       echo '\n--- Per-function coverage ---' &&
       go tool cover -func=coverage.out
     "]
-
-  # ---------------- linediff (set-based CSV diff helper) ----------------
-  linediff:
-    build:
-      context: ./go-app
-      dockerfile: Dockerfile-linediff
-    container_name: linediff
-    profiles: ["tools", "linediff"]
-    volumes:
-      - ./data:/data:ro    # read your CSVs from ./data on host
-    working_dir: /data     # user can reference files directly
-    entrypoint: ["/linediff"]  # built binary inside container
 
 volumes:
   pgdata:

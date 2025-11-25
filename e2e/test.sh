@@ -11,46 +11,51 @@
 # Run from e2e/ directory
 cd "$(dirname "$0")"
 
-# 1 & 2. Build etl & probe via docker compose build
+# 1. Build etl & probe via docker compose build
 docker compose build
+
+# 2. start pushgateway
+docker compose up pushgateway -d
 
 # 3. Use probe to generate config from CSV into /configs/pipeline.json
 docker compose run --rm etl-probe -c '
 #  set -eux
 NAME="sample"
+# populate file
+echo -n "id,shape,volume
+1,candycane,301
+2,swallow,940" > sample.csv
   # Probe: generate JSON config from local CSV.
   # Adjust flags to match your probe CLI.
   probe \
-    -url="file:///data/sample.csv" \
+    -url="file://sample.csv" \
     -name="$NAME" \
     -bytes=8192 \
     -backend=sqlite \
-    -pretty | sed -e "s/sample.csv/\/data\/sample.csv/g" > /configs/pipeline.json
+    -pretty > /configs/pipeline.json
   ls /data
 
   cat /configs/pipeline.json
 
-  # install curl 
-  apk add curl > /dev/null
-
 # 4. delete old pushgateway metrics
-for i in $(curl -s pushgateway:9091/metrics | grep -o job=.* | cut -f2 -d\" | sort | uniq); do
+for i in $(wget -O - pushgateway:9091/metrics | grep -o job=.* | cut -f2 -d\" | sort | uniq); do
 		echo $i
-		curl -X DELETE http://pushgateway:9091/metrics/job/$i
+		wget --method=DELETE --quiet http://pushgateway:9091/metrics/job/$i
 done
 
 
 # 5. Run ETL with generated config; SQLite DB will be created in /data/db/etl.db
-  etl -config /configs/pipeline.json
+  etl -metrics-backend pushgateway -pushgateway-url http://pushgateway:9091 -config /configs/pipeline.json
 
 # 6. Verify metrics in Pushgateway.
 
-if [[ $(curl -s -o - http://pushgateway:9091/metrics | grep "$NAME" | grep inserted | cut -f2 -d" ") -eq 2 ]]
+GOT=$(wget --quiet -O - http://pushgateway:9091/metrics | grep "$NAME" | grep inserted | cut -f2 -d" ")
+if [[ $(wget -O - --quiet http://pushgateway:9091/metrics | grep "$NAME" | grep inserted | cut -f2 -d" ") -eq 2 ]]
 then
 	# echo "E2E test passed."
 	exit 0
 else
-	# echo "E2E test failed."
+	echo "FAILED: E2E test failed. Expected 2, got $GOT"
 	exit 1
 fi
 

@@ -1,10 +1,14 @@
 # login 
 docker exec -it mssql bash
-/opt/mssql-tools18/bin/sqlcmd -U app -P 'P@ssw0rd123!' -C
+/opt/mssql-tools18/bin/sqlcmd -U user -P 'password' -C
 
 # query
 1> SELECT name FROM sys.databases;
 2> GO
+
+use testdb;
+go
+
 
 # list users
 SELECT name, type_desc, is_disabled
