@@ -1,3 +1,9 @@
+# set credentials
+source .env-dev
+
+# start db (first run also runs mssql-init process)
+docker compose --profile mssql up
+
 # login 
 docker exec -it mssql bash
 /opt/mssql-tools18/bin/sqlcmd -U user -P 'password' -C
@@ -16,3 +22,7 @@ FROM sys.sql_logins;
 GO
 
 ALTER LOGIN [user] WITH PASSWORD = 'password';
+
+# remove volume
+docker stop -t 0 mssql
+docker volume rm etl_pipeline_mssql-data
