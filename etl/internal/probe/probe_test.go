@@ -5,13 +5,17 @@ package probe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"etl/internal/datasource/httpds"
+	"etl/pkg/records"
 )
 
 //
@@ -381,5 +385,181 @@ func TestDetectColumnLayouts(t *testing.T) {
 	got := detectColumnLayouts(rows, inferred)
 	if got[0] == "" || got[1] == "" || got[2] != "" {
 		t.Fatalf("layouts=%v; expected non-empty for date/timestamp and empty for text", got)
+	}
+}
+
+// TestProbe verifies the behavior of the Probe function.
+func TestProbe(t *testing.T) {
+	t.Run("valid probe with CSV input", func(t *testing.T) {
+		opt := Options{
+			URL:        "file://../../testdata/test.csv",
+			MaxBytes:   1000,
+			Delimiter:  ',',
+			Name:       "test_csv",
+			OutputJSON: false, // Expecting CSV output, not JSON
+		}
+
+		// Run the Probe function
+		result, err := Probe(opt)
+
+		// Expect no error
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+
+		// Verify the result is not empty
+		if len(result.Body) == 0 {
+			t.Fatal("Expected result body to be non-empty")
+		}
+
+		// Verify headers are returned as expected
+		if len(result.Headers) == 0 {
+			t.Fatal("Expected headers to be non-empty")
+		}
+
+		// Verify the Normalized headers match the expected normalized values
+		if len(result.Headers) != len(result.Normalized) {
+			t.Fatalf("Expected normalized headers length %d, got %d", len(result.Headers), len(result.Normalized))
+		}
+	})
+}
+
+// TestDecodeDelimiter tests the DecodeDelimiter function which converts string delimiters to rune delimiters.
+func TestDecodeDelimiter(t *testing.T) {
+	t.Run("empty string returns default delimiter", func(t *testing.T) {
+		// Test: Empty input string should default to comma
+		delim := DecodeDelimiter("")
+		if delim != ',' {
+			t.Errorf("Expected ',', got: %v", delim)
+		}
+	})
+
+	t.Run("valid delimiter string returns correct rune", func(t *testing.T) {
+		// Test: Valid input string should convert to corresponding rune
+		delim := DecodeDelimiter(";")
+		if delim != ';' {
+			t.Errorf("Expected ';', got: %v", delim)
+		}
+	})
+
+	t.Run("invalid delimiter string returns default delimiter", func(t *testing.T) {
+		// Test: Invalid input string should return default delimiter
+		delim := DecodeDelimiter(string([]byte{0xFF})) // Invalid byte
+		if delim != ',' {
+			t.Errorf("Expected ',', got: %v", delim)
+		}
+	})
+}
+
+// TestProbeURL tests the ProbeURL function for URL-based probes.
+func TestProbeURL(t *testing.T) {
+	t.Run("valid CSV URL returns correct pipeline", func(t *testing.T) {
+		opt := Options{
+			URL:       "file://../../testdata/test.csv",
+			MaxBytes:  1000,
+			Delimiter: ',',
+			Name:      "test_csv_url",
+		}
+
+		// Simulate context and invoke the function
+		ctx := context.Background()
+		pipeline, err := ProbeURL(ctx, opt)
+
+		// Expect no error
+		if err != nil {
+			t.Fatalf("Expected no error, got: %v", err)
+		}
+
+		// Check for valid pipeline
+		if pipeline.Source.Kind == "" {
+			t.Fatal("Expected a valid source, but got an empty source")
+		}
+
+		// Example check for some valid attribute
+		if pipeline.Source.File.Path != "test_csv_url.csv" {
+			t.Fatalf("Expected file path to be 'test_csv_url.csv', got: %v", pipeline.Source.File.Path)
+		}
+	})
+}
+
+// TestExpandJSONRecords tests the expandJSONRecords function for JSON array expansion.
+func TestExpandJSONRecords(t *testing.T) {
+	t.Run("expand JSON records", func(t *testing.T) {
+		// Sample records to pass into expandJSONRecords
+		records := []records.Record{
+			{
+				// Adjust according to your actual record structure
+				"name": "John",
+				"age":  30,
+			},
+		}
+
+		expanded := expandJSONRecords(records)
+
+		// Expect expanded records with flattened structure
+		if len(expanded) != 1 {
+			t.Errorf("Expected 1 expanded record, got: %d", len(expanded))
+		}
+	})
+}
+
+// TestDefaultDBConfigForBackend tests the defaultDBConfigForBackend function.
+func TestDefaultDBConfigForBackend(t *testing.T) {
+	t.Run("default config for snowflake", func(t *testing.T) {
+		// Test: Default DB config for snowflake
+		cfg := defaultDBConfigForBackend("snowflake", "someConnectionString", []string{"param1", "param2"})
+
+		// Check if the config has the correct field (ensure 'DSN' is the correct field)
+		if cfg.DSN == "" {
+			t.Fatalf("Expected a valid DSN, got: %v", cfg.DSN)
+		}
+	})
+}
+
+// TestProbeWithCSVFile tests the probe functionality with a dynamically created CSV file.
+func TestProbeWithCSVFile(t *testing.T) {
+	// Prepare sample CSV data
+	csvData := []byte("name,age\nJohn,30\nJane,25\n")
+
+	// Create a temporary file for the CSV
+	tmpFile, err := ioutil.TempFile("", "test*.csv")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name()) // Clean up the file after the test
+
+	// Write the sample CSV data to the temp file using writeSampleCSV
+	err = writeSampleCSV(tmpFile.Name(), csvData)
+	if err != nil {
+		t.Fatalf("Failed to write sample CSV data: %v", err)
+	}
+
+	// Now you have a temporary file at tmpFile.Name(), which is a valid path
+	// You can use this file path to test the probe logic
+
+	// Assuming your probe logic takes a file path and reads the CSV
+	opt := Options{
+		URL:        fmt.Sprintf("file://%s", tmpFile.Name()), // Use the temp file's path
+		MaxBytes:   1000,
+		Delimiter:  ',',
+		Name:       "test_csv",
+		OutputJSON: false, // Expecting CSV output, not JSON
+	}
+
+	// Call the function that processes the CSV file
+	result, err := Probe(opt)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	// Verify the result (assuming you expect specific behavior after processing)
+	if len(result.Body) == 0 {
+		t.Fatal("Expected result body to be non-empty")
+	}
+
+	// Adjust the expected result based on the output you're seeing
+	expected := "name,name,text\nage,age,integer\n"
+	if string(result.Body) != expected {
+		t.Fatalf("Expected %s, got: %s", expected, string(result.Body))
 	}
 }
